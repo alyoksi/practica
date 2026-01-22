@@ -220,6 +220,7 @@ class BoundingBoxApp(QMainWindow):
         frame_layout.addWidget(unit_label)
 
         setattr(self, f"{attr}_label", value_label)
+        setattr(self, f"{attr}_unit_label", unit_label)
 
         parent_layout.addWidget(frame)
 
@@ -234,9 +235,11 @@ class BoundingBoxApp(QMainWindow):
         value_label.setAlignment(Qt.AlignCenter)
         frame_layout.addWidget(value_label)
 
-        frame_layout.addWidget(QLabel(unit))
+        unit_label = QLabel(unit)
+        frame_layout.addWidget(unit_label)
 
         setattr(self, f"{attr}_label", value_label)
+        setattr(self, f"{attr}_unit_label", unit_label)
 
         parent_layout.addWidget(frame)
 
@@ -303,6 +306,13 @@ class BoundingBoxApp(QMainWindow):
     def _update_display(self):
         unit = self.unit_var
 
+        # Update unit labels
+        self.x_unit_label.setText(unit)
+        self.y_unit_label.setText(unit)
+        self.z_unit_label.setText(unit)
+        self.area_unit_label.setText(f"{unit}²")
+        self.volume_unit_label.setText(f"{unit}³")
+
         # Линейные размеры
         if self.raw_x is not None:
             conv_x = _convert_value(self.raw_x, "мм", unit)
@@ -366,7 +376,10 @@ class BoundingBoxApp(QMainWindow):
             self.visualizer.reset_scene()
             self.visualizer.load_stl(file_path)
             self.visualizer.show_axes()
-            self.visualizer.set_transform(result.get('rotation_matrix', None) if result else None)
+            self.visualizer.set_transform(
+                result.get('rotation_matrix', None) if result else None,
+                result.get('origin', None) if result else None
+            )
             if self.raw_x is not None:
                 self.visualizer.show_bounding_box(self.raw_x, self.raw_y, self.raw_z)
             self.viz_widget.setVisible(True)

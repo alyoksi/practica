@@ -155,6 +155,8 @@ class STLVisualizer:
         actor.SetMapper(mapper)
         actor.GetProperty().SetColor(1.0, 0.0, 0.0)  # Red
         actor.GetProperty().SetRepresentationToWireframe()
+        actor.GetProperty().SetLineWidth(3)  # Make wireframe thicker
+        actor.GetProperty().LightingOff()  # Disable lighting for consistent visibility
 
         # Center the bounding box at the model's center
         bounds = self.actor.GetBounds()
@@ -169,10 +171,12 @@ class STLVisualizer:
         self.renderer.AddActor(actor)
         self.render_window.Render()
 
-    def set_transform(self, rotation_matrix):
-        """Apply rotation matrix to the actor"""
+    def set_transform(self, rotation_matrix, origin=None):
+        """Apply rotation matrix and translation to the actor"""
         if rotation_matrix is None:
             self.actor.SetUserTransform(None)
+            self.renderer.ResetCamera()
+            self.render_window.Render()
             return
 
         # Assuming rotation_matrix is 3x3 numpy array
@@ -180,7 +184,12 @@ class STLVisualizer:
 
         # Convert 3x3 to 4x4 homogeneous
         matrix_4x4 = np.eye(4)
-        matrix_4x4[:3, :3] = rotation_matrix
+        rotation_matrix_T = rotation_matrix.T
+        matrix_4x4[:3, :3] = rotation_matrix_T
+
+        # Add translation to center the model: translate by -origin, then rotate by rotation_matrix_T
+        if origin is not None:
+            matrix_4x4[:3, 3] = -np.dot(rotation_matrix_T, origin)
 
         # Create VTK matrix
         if VTK_MODERN:
