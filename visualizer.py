@@ -27,6 +27,7 @@ except ImportError:
     vtkOrientationMarkerWidget = vtk.vtkOrientationMarkerWidget
     vtkAxesActor = vtk.vtkAxesActor
     vtkTransform = vtk.vtkTransform
+    vtkMatrix4x4 = vtk.vtkMatrix4x4
     vtkGlobalWarningDisplayOff = vtk.vtkObject.GlobalWarningDisplayOff
     vtkOutputWindow = vtk.vtkOutputWindow
     VTK_MODERN = False
@@ -72,6 +73,8 @@ class STLVisualizer:
 
         self.reader.SetFileName(filename)
         self.reader.Update()
+        # Reset transform for new file
+        self.actor.SetUserTransform(None)
 
         # Auto-adjust camera
         bounds = self.actor.GetBounds()
@@ -126,6 +129,16 @@ class STLVisualizer:
             self.render_window_interactor.Initialize()
         self.render_window.Render()
 
+    def reset_scene(self):
+        """Reset the scene for loading a new model"""
+        if self.bound_box_actor:
+            self.renderer.RemoveActor(self.bound_box_actor)
+            self.bound_box_actor = None
+        if self.axes_widget:
+            self.axes_widget.EnabledOff()
+            self.axes_widget = None
+        self.actor.SetUserTransform(None)
+
     def show_bounding_box(self, x, y, z):
         if self.bound_box_actor is not None:
             self.renderer.RemoveActor(self.bound_box_actor)
@@ -154,6 +167,36 @@ class STLVisualizer:
 
         self.bound_box_actor = actor
         self.renderer.AddActor(actor)
+        self.render_window.Render()
+
+    def set_transform(self, rotation_matrix):
+        """Apply rotation matrix to the actor"""
+        if rotation_matrix is None:
+            self.actor.SetUserTransform(None)
+            return
+
+        # Assuming rotation_matrix is 3x3 numpy array
+        import numpy as np
+
+        # Convert 3x3 to 4x4 homogeneous
+        matrix_4x4 = np.eye(4)
+        matrix_4x4[:3, :3] = rotation_matrix
+
+        # Create VTK matrix
+        if VTK_MODERN:
+            from vtkmodules.vtkCommonMath import vtkMatrix4x4
+        else:
+            vtkMatrix4x4 = vtk.vtkMatrix4x4
+
+        vtk_matrix = vtkMatrix4x4()
+        for i in range(4):
+            for j in range(4):
+                vtk_matrix.SetElement(i, j, matrix_4x4[i, j])
+
+        transform = vtkTransform()
+        transform.SetMatrix(vtk_matrix)
+        self.actor.SetUserTransform(transform)
+        self.renderer.ResetCamera()
         self.render_window.Render()
 
 

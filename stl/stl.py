@@ -200,7 +200,7 @@ def calculate_aligned_bounding_box(triangles, normal_vector, origin):
     best_rotation = None
 
     # Пробуем поворот с шагом 1 градус
-    for angle_deg in np.arange(0, 180, 0.1):
+    for angle_deg in np.arange(0, 180, 1):
         angle_rad = np.deg2rad(angle_deg)
 
         # Базовые оси в плоскости

@@ -363,8 +363,10 @@ class BoundingBoxApp(QMainWindow):
                 self.viz_widget.setMaximumHeight(400)
                 self.visualizer.set_render_window(self.viz_interactor.GetRenderWindow())
                 self.visualizer.set_interactor(self.viz_interactor.GetRenderWindow().GetInteractor())
+            self.visualizer.reset_scene()
             self.visualizer.load_stl(file_path)
             self.visualizer.show_axes()
+            self.visualizer.set_transform(result.get('rotation_matrix', None) if result else None)
             if self.raw_x is not None:
                 self.visualizer.show_bounding_box(self.raw_x, self.raw_y, self.raw_z)
             self.viz_widget.setVisible(True)
