@@ -171,17 +171,16 @@ class BoundingBoxApp(QMainWindow):
 
         layout = QVBoxLayout(widget)
 
-        layout.addWidget(
-            QLabel("Максимальные размеры детали")
-        )
+        # 1. Максимальные размеры детали label with increased font size
+        max_label = QLabel("Максимальные размеры детали")
+        max_label.setStyleSheet("font-size: 14pt; font-weight: bold;")
+        layout.addWidget(max_label)
 
         dims_layout = QHBoxLayout()
         self._create_axis_block(dims_layout, "X", "длина", "x")
         self._create_axis_block(dims_layout, "Y", "ширина", "y")
         self._create_axis_block(dims_layout, "Z", "высота", "z")
         layout.addLayout(dims_layout)
-
-        # layout.addWidget(QLabel("мм"))
 
         extras_layout = QHBoxLayout()
         self._create_extra_block(extras_layout, "Площадь", "мм²", "area")
@@ -197,6 +196,19 @@ class BoundingBoxApp(QMainWindow):
         unit_layout.addStretch()
         layout.addLayout(unit_layout)
 
+        # Horizontal line separator (under the unit selection field)
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        line.setLineWidth(1)
+        line.setStyleSheet("color: gray;")
+        layout.addWidget(line)
+
+        # Необходимые размеры детали label with same font size
+        needed_label = QLabel("Необходимые размеры детали")
+        needed_label.setStyleSheet("font-size: 14pt; font-weight: bold;")
+        layout.addWidget(needed_label)
+
         layout.addStretch()
 
         return widget
@@ -204,20 +216,30 @@ class BoundingBoxApp(QMainWindow):
     def _create_axis_block(self, parent_layout, axis, label, attr):
         frame = QFrame()
         frame_layout = QVBoxLayout(frame)
+        frame_layout.setContentsMargins(8, 8, 8, 8)
 
-        axis_label = QLabel(axis)
+        # First line: axis and label
+        header_layout = QHBoxLayout()
+        axis_label = QLabel(f"{axis} ({label})")
         axis_label.setStyleSheet("font-weight: bold;")
-        frame_layout.addWidget(axis_label)
+        header_layout.addWidget(axis_label)
+        header_layout.addStretch()
+        frame_layout.addLayout(header_layout)
 
-        frame_layout.addWidget(QLabel(label))
-
+        # Second line: field and unit
+        field_layout = QHBoxLayout()
         value_label = QLabel("—")
         value_label.setStyleSheet("border: 1px solid; padding: 2px;")
         value_label.setAlignment(Qt.AlignCenter)
-        frame_layout.addWidget(value_label)
+        value_label.setMinimumWidth(120)
+        field_layout.addWidget(value_label)
 
         unit_label = QLabel("мм")
-        frame_layout.addWidget(unit_label)
+        unit_label.setFixedWidth(40)
+        field_layout.addWidget(unit_label)
+        field_layout.addStretch()
+
+        frame_layout.addLayout(field_layout)
 
         setattr(self, f"{attr}_label", value_label)
         setattr(self, f"{attr}_unit_label", unit_label)
@@ -227,16 +249,30 @@ class BoundingBoxApp(QMainWindow):
     def _create_extra_block(self, parent_layout, name, unit, attr):
         frame = QFrame()
         frame_layout = QVBoxLayout(frame)
+        frame_layout.setContentsMargins(8, 8, 8, 8)
 
-        frame_layout.addWidget(QLabel(name))
+        # First line: name
+        header_layout = QHBoxLayout()
+        name_label = QLabel(name)
+        name_label.setStyleSheet("font-weight: bold;")
+        header_layout.addWidget(name_label)
+        header_layout.addStretch()
+        frame_layout.addLayout(header_layout)
 
+        # Second line: field and unit
+        field_layout = QHBoxLayout()
         value_label = QLabel("—")
         value_label.setStyleSheet("border: 1px solid; padding: 2px;")
         value_label.setAlignment(Qt.AlignCenter)
-        frame_layout.addWidget(value_label)
+        value_label.setMinimumWidth(120)
+        field_layout.addWidget(value_label)
 
         unit_label = QLabel(unit)
-        frame_layout.addWidget(unit_label)
+        unit_label.setFixedWidth(40)
+        field_layout.addWidget(unit_label)
+        field_layout.addStretch()
+
+        frame_layout.addLayout(field_layout)
 
         setattr(self, f"{attr}_label", value_label)
         setattr(self, f"{attr}_unit_label", unit_label)
@@ -380,8 +416,11 @@ class BoundingBoxApp(QMainWindow):
                 result.get('rotation_matrix', None) if result else None,
                 result.get('origin', None) if result else None
             )
-            if self.raw_x is not None:
-                self.visualizer.show_bounding_box(self.raw_x, self.raw_y, self.raw_z)
+            if result is not None:
+                self.visualizer.show_bounding_box(
+                    result.get("min_coords"),
+                    result.get("max_coords"),
+                )
             self.viz_widget.setVisible(True)
             if self.viz_interactor:
                 self.viz_interactor.GetRenderWindow().Render()

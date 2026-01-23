@@ -139,14 +139,21 @@ class STLVisualizer:
             self.axes_widget = None
         self.actor.SetUserTransform(None)
 
-    def show_bounding_box(self, x, y, z):
+    def show_bounding_box(self, min_coords, max_coords):
         if self.bound_box_actor is not None:
             self.renderer.RemoveActor(self.bound_box_actor)
 
+        import numpy as np
+
+        min_coords = np.array(min_coords, dtype=float)
+        max_coords = np.array(max_coords, dtype=float)
+        center = (min_coords + max_coords) / 2
+        sizes = max_coords - min_coords
+
         cube = vtkCubeSource()
-        cube.SetXLength(x)
-        cube.SetYLength(y)
-        cube.SetZLength(z)
+        cube.SetXLength(sizes[0])
+        cube.SetYLength(sizes[1])
+        cube.SetZLength(sizes[2])
 
         mapper = vtkPolyDataMapper()
         mapper.SetInputConnection(cube.GetOutputPort())
@@ -158,13 +165,6 @@ class STLVisualizer:
         actor.GetProperty().SetLineWidth(3)  # Make wireframe thicker
         actor.GetProperty().LightingOff()  # Disable lighting for consistent visibility
 
-        # Center the bounding box at the model's center
-        bounds = self.actor.GetBounds()
-        center = [
-            (bounds[0] + bounds[1]) / 2,
-            (bounds[2] + bounds[3]) / 2,
-            (bounds[4] + bounds[5]) / 2,
-        ]
         actor.SetPosition(center)
 
         self.bound_box_actor = actor
