@@ -111,6 +111,11 @@ class BoundingBoxApp(QMainWindow):
         self.raw_area = None
         self.raw_volume = None
 
+        # Необходимые размеры (по умолчанию те же, что и максимальные)
+        self.needed_x = None
+        self.needed_y = None
+        self.needed_z = None
+
         self.dxf_module = dxfmod
         self.stl_module = stlmod
 
@@ -208,6 +213,13 @@ class BoundingBoxApp(QMainWindow):
         needed_label = QLabel("Необходимые размеры детали")
         needed_label.setStyleSheet("font-size: 14pt; font-weight: bold;")
         layout.addWidget(needed_label)
+
+        # Needed dimensions blocks (same format as max dimensions)
+        needed_dims_layout = QHBoxLayout()
+        self._create_axis_block(needed_dims_layout, "X", "длина", "needed_x")
+        self._create_axis_block(needed_dims_layout, "Y", "ширина", "needed_y")
+        self._create_axis_block(needed_dims_layout, "Z", "высота", "needed_z")
+        layout.addLayout(needed_dims_layout)
 
         layout.addStretch()
 
@@ -333,6 +345,11 @@ class BoundingBoxApp(QMainWindow):
         self.raw_area = area
         self.raw_volume = volume
 
+        # Необходимые размеры по умолчанию те же, что и максимальные
+        self.needed_x = self.raw_x
+        self.needed_y = self.raw_y
+        self.needed_z = self.raw_z
+
         # Обновляем отображение с текущими единицами
         self._update_display()
 
@@ -342,14 +359,18 @@ class BoundingBoxApp(QMainWindow):
     def _update_display(self):
         unit = self.unit_var
 
-        # Update unit labels
+        # Update unit labels for max dimensions
         self.x_unit_label.setText(unit)
         self.y_unit_label.setText(unit)
         self.z_unit_label.setText(unit)
         self.area_unit_label.setText(f"{unit}²")
         self.volume_unit_label.setText(f"{unit}³")
+        # Update unit labels for needed dimensions
+        self.needed_x_unit_label.setText(unit)
+        self.needed_y_unit_label.setText(unit)
+        self.needed_z_unit_label.setText(unit)
 
-        # Линейные размеры
+        # Максимальные линейные размеры
         if self.raw_x is not None:
             conv_x = _convert_value(self.raw_x, "мм", unit)
             self.x_label.setText(_format_dimension(conv_x, unit))
@@ -367,6 +388,25 @@ class BoundingBoxApp(QMainWindow):
             self.z_label.setText(_format_dimension(conv_z, unit))
         else:
             self.z_label.setText("—")
+
+        # Необходимые линейные размеры (по умолчанию те же значения)
+        if self.needed_x is not None:
+            conv_nx = _convert_value(self.needed_x, "мм", unit)
+            self.needed_x_label.setText(_format_dimension(conv_nx, unit))
+        else:
+            self.needed_x_label.setText("—")
+
+        if self.needed_y is not None:
+            conv_ny = _convert_value(self.needed_y, "мм", unit)
+            self.needed_y_label.setText(_format_dimension(conv_ny, unit))
+        else:
+            self.needed_y_label.setText("—")
+
+        if self.needed_z is not None:
+            conv_nz = _convert_value(self.needed_z, "мм", unit)
+            self.needed_z_label.setText(_format_dimension(conv_nz, unit))
+        else:
+            self.needed_z_label.setText("—")
 
         # Площадь
         if self.raw_area is not None:
