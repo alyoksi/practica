@@ -47,6 +47,8 @@ class STLVisualizer:
         self.bbox_actor = None
         self.axes_widget = None
         self.bound_box_actor = None  # Rename to be consistent or change name
+        self.original_bounds = None
+        self.current_transform = None
 
         self._setup_pipeline()
 
@@ -75,9 +77,13 @@ class STLVisualizer:
         self.reader.Update()
         # Reset transform for new file
         self.actor.SetUserTransform(None)
+        self.current_transform = None
+        
+        # Store original bounds
+        bounds = self.actor.GetBounds()
+        self.original_bounds = bounds
 
         # Auto-adjust camera
-        bounds = self.actor.GetBounds()
         center = [
             (bounds[0] + bounds[1]) / 2,
             (bounds[2] + bounds[3]) / 2,
@@ -175,11 +181,19 @@ class STLVisualizer:
         """Apply rotation matrix and translation to the actor"""
         if rotation_matrix is None:
             self.actor.SetUserTransform(None)
+            self.current_transform = None
             self.renderer.ResetCamera()
             self.render_window.Render()
             return
 
-        # Assuming rotation_matrix is 3x3 numpy array
+        transform = self.build_rotation_transform(rotation_matrix, origin)
+        self.actor.SetUserTransform(transform)
+        self.current_transform = transform
+        self.renderer.ResetCamera()
+        self.render_window.Render()
+
+    def build_rotation_transform(self, rotation_matrix, origin=None):
+        """Build a rotation/translation transform from a matrix and origin."""
         import numpy as np
 
         # Convert 3x3 to 4x4 homogeneous
@@ -204,9 +218,58 @@ class STLVisualizer:
 
         transform = vtkTransform()
         transform.SetMatrix(vtk_matrix)
-        self.actor.SetUserTransform(transform)
-        self.renderer.ResetCamera()
+        return transform
+
+    def scale_model(self, x_scale=1.0, y_scale=1.0, z_scale=1.0, center=None, rotation_transform=None):
+        """Scale the model by specified factors along each axis around an optional center"""
+        import numpy as np
+        
+        # Create scaling matrix
+        scale_matrix = np.eye(4)
+        scale_matrix[0, 0] = x_scale
+        scale_matrix[1, 1] = y_scale
+        scale_matrix[2, 2] = z_scale
+        
+        # Create VTK matrix
+        if VTK_MODERN:
+            from vtkmodules.vtkCommonMath import vtkMatrix4x4
+        else:
+            vtkMatrix4x4 = vtk.vtkMatrix4x4
+            
+        vtk_scale_matrix = vtkMatrix4x4()
+        for i in range(4):
+            for j in range(4):
+                vtk_scale_matrix.SetElement(i, j, scale_matrix[i, j])
+        
+        # Create scaling transform
+        scale_transform = vtkTransform()
+        scale_transform.SetMatrix(vtk_scale_matrix)
+
+        # Combine transforms: scale in aligned space, then apply rotation/translation
+        combined_transform = vtkTransform()
+        combined_transform.PostMultiply()
+
+        # Scale around center in aligned coordinates
+        if center is not None:
+            combined_transform.Translate(center[0], center[1], center[2])
+        combined_transform.Concatenate(scale_transform)
+        if center is not None:
+            combined_transform.Translate(-center[0], -center[1], -center[2])
+
+        # Apply rotation transform afterwards
+        if rotation_transform is not None:
+            combined_transform.Concatenate(rotation_transform)
+        elif self.current_transform is not None:
+            combined_transform.Concatenate(self.current_transform)
+
+        self.actor.SetUserTransform(combined_transform)
+        self.current_transform = combined_transform
+        
         self.render_window.Render()
+        
+        # Return new bounds
+        bounds = self.actor.GetBounds()
+        return bounds
 
 
 if __name__ == "__main__":

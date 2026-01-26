@@ -1,8 +1,7 @@
-import importlib.util
 import os
 import sys
 
-import dxf.dxf as dxfmod
+import numpy as np
 import stl.stl as stlmod
 import visualizer
 
@@ -111,16 +110,19 @@ class BoundingBoxApp(QMainWindow):
         self.raw_area = None
         self.raw_volume = None
 
-        # Необходимые размеры (по умолчанию те же, что и максимальные)
-        self.needed_x = None
-        self.needed_y = None
-        self.needed_z = None
+        # Базовые (исходные) размеры для пропорций
+        self.base_raw_x = None
+        self.base_raw_y = None
+        self.base_raw_z = None
+        self.base_raw_area = None
+        self.base_raw_volume = None
 
-        self.dxf_module = dxfmod
         self.stl_module = stlmod
 
         self.visualizer = None
         self.viz_interactor = None
+
+        self._updating_display = False  # Флаг для предотвращения рекурсии
 
         self._build_ui()
 
@@ -146,7 +148,7 @@ class BoundingBoxApp(QMainWindow):
         layout = QVBoxLayout(widget)
 
         layout.addWidget(
-            QLabel("Перетащите сюда файл одной детали (dxf или stl)")
+            QLabel("Перетащите сюда STL файл детали")
         )
 
         self.drop_area = DropArea(self)
@@ -176,8 +178,7 @@ class BoundingBoxApp(QMainWindow):
 
         layout = QVBoxLayout(widget)
 
-        # 1. Максимальные размеры детали label with increased font size
-        max_label = QLabel("Максимальные размеры детали")
+        max_label = QLabel("Текущие размеры детали")
         max_label.setStyleSheet("font-size: 14pt; font-weight: bold;")
         layout.addWidget(max_label)
 
@@ -199,27 +200,14 @@ class BoundingBoxApp(QMainWindow):
         self.unit_combo.currentTextChanged.connect(self._update_units)
         unit_layout.addWidget(self.unit_combo)
         unit_layout.addStretch()
+        
+        # Кнопка восстановления размеров
+        self.restore_button = QPushButton("Вернуть начальные размеры")
+        self.restore_button.clicked.connect(self._restore_original)
+        self.restore_button.setEnabled(False)
+        unit_layout.addWidget(self.restore_button)
+        
         layout.addLayout(unit_layout)
-
-        # Horizontal line separator (under the unit selection field)
-        line = QFrame()
-        line.setFrameShape(QFrame.HLine)
-        line.setFrameShadow(QFrame.Sunken)
-        line.setLineWidth(1)
-        line.setStyleSheet("color: gray;")
-        layout.addWidget(line)
-
-        # Необходимые размеры детали label with same font size
-        needed_label = QLabel("Необходимые размеры детали")
-        needed_label.setStyleSheet("font-size: 14pt; font-weight: bold;")
-        layout.addWidget(needed_label)
-
-        # Needed dimensions blocks (same format as max dimensions)
-        needed_dims_layout = QHBoxLayout()
-        self._create_axis_block(needed_dims_layout, "X", "длина", "needed_x")
-        self._create_axis_block(needed_dims_layout, "Y", "ширина", "needed_y")
-        self._create_axis_block(needed_dims_layout, "Z", "высота", "needed_z")
-        layout.addLayout(needed_dims_layout)
 
         layout.addStretch()
 
@@ -240,11 +228,13 @@ class BoundingBoxApp(QMainWindow):
 
         # Second line: field and unit
         field_layout = QHBoxLayout()
-        value_label = QLabel("—")
-        value_label.setStyleSheet("border: 1px solid; padding: 2px;")
-        value_label.setAlignment(Qt.AlignCenter)
-        value_label.setMinimumWidth(120)
-        field_layout.addWidget(value_label)
+        value_edit = QLineEdit("—")
+        value_edit.setStyleSheet("border: 1px solid; padding: 2px;")
+        value_edit.setAlignment(Qt.AlignCenter)
+        value_edit.setMinimumWidth(120)
+        value_edit.setReadOnly(True)
+        value_edit.setEnabled(False)
+        field_layout.addWidget(value_edit)
 
         unit_label = QLabel("мм")
         unit_label.setFixedWidth(40)
@@ -253,8 +243,13 @@ class BoundingBoxApp(QMainWindow):
 
         frame_layout.addLayout(field_layout)
 
-        setattr(self, f"{attr}_label", value_label)
+        setattr(self, f"{attr}_edit", value_edit)
         setattr(self, f"{attr}_unit_label", unit_label)
+
+        # Connect returnPressed signal (triggers only on Enter key press)
+        value_edit.returnPressed.connect(
+            lambda checked=False, a=attr: self._on_dimension_changed(a)
+        )
 
         parent_layout.addWidget(frame)
 
@@ -294,9 +289,9 @@ class BoundingBoxApp(QMainWindow):
     def _pick_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Выберите файл детали",
+            "Выберите STL файл детали",
             "",
-            "DXF и STL (*.dxf *.stl);;Все файлы (*.*)",
+            "STL файлы (*.stl);;Все файлы (*.*)",
         )
         if file_path:
             self._handle_file(file_path)
@@ -306,8 +301,8 @@ class BoundingBoxApp(QMainWindow):
         self.file_label.setText(file_path)
         extension = os.path.splitext(file_path)[1].lower()
 
-        if extension not in (".dxf", ".stl"):
-            self.status_text = "Неподходящий файл. Нужен .dxf или .stl"
+        if extension != ".stl":
+            self.status_text = "Неподходящий файл. Нужен .stl файл"
             self.status_label.setText(self.status_text)
             self._clear_raw()
             self._update_display()
@@ -317,15 +312,10 @@ class BoundingBoxApp(QMainWindow):
         self.status_label.setText("")
 
         try:
-            if extension == ".dxf":
-                dims = self.dxf_module.get_bounding_box_dimensions(file_path)
-                area = self.dxf_module.bounding_rect_area(file_path)
-                volume = self.dxf_module.bounding_volume(file_path)
-            else:
-                dims = self.stl_module.get_bounding_box_dimensions(file_path, aligned=True)
-                result = self.stl_module.calculate_parallelepiped_volume(file_path)
-                area = None
-                volume = result["volume"] if result else None
+            dims = self.stl_module.get_bounding_box_dimensions(file_path, aligned=True)
+            result = self.stl_module.calculate_parallelepiped_volume(file_path)
+            area = None
+            volume = result["volume"] if result else None
         except Exception as exc:
             self.status_text = f"Ошибка чтения файла: {exc}"
             self.status_label.setText(self.status_text)
@@ -345,12 +335,22 @@ class BoundingBoxApp(QMainWindow):
         self.raw_area = area
         self.raw_volume = volume
 
-        # Необходимые размеры по умолчанию те же, что и максимальные
-        self.needed_x = self.raw_x
-        self.needed_y = self.raw_y
-        self.needed_z = self.raw_z
+        # Сохраняем базовые размеры для пропорций
+        self.base_raw_x, self.base_raw_y, self.base_raw_z = dims
+        self.base_raw_area = area
+        self.base_raw_volume = volume
 
-        # Обновляем отображение с текущими единицами
+        # Включаем поля для редактирования
+        self.x_edit.setReadOnly(False)
+        self.x_edit.setEnabled(True)
+        self.y_edit.setReadOnly(False)
+        self.y_edit.setEnabled(True)
+        self.z_edit.setReadOnly(False)
+        self.z_edit.setEnabled(True)
+        
+        # Включаем кнопку восстановления
+        self.restore_button.setEnabled(True)
+
         self._update_display()
 
         # Setup visualization if STL
@@ -359,54 +359,35 @@ class BoundingBoxApp(QMainWindow):
     def _update_display(self):
         unit = self.unit_var
 
-        # Update unit labels for max dimensions
+        # Update unit labels
         self.x_unit_label.setText(unit)
         self.y_unit_label.setText(unit)
         self.z_unit_label.setText(unit)
         self.area_unit_label.setText(f"{unit}²")
         self.volume_unit_label.setText(f"{unit}³")
-        # Update unit labels for needed dimensions
-        self.needed_x_unit_label.setText(unit)
-        self.needed_y_unit_label.setText(unit)
-        self.needed_z_unit_label.setText(unit)
 
-        # Максимальные линейные размеры
-        if self.raw_x is not None:
-            conv_x = _convert_value(self.raw_x, "мм", unit)
-            self.x_label.setText(_format_dimension(conv_x, unit))
-        else:
-            self.x_label.setText("—")
+        # Линейные размеры
+        self._updating_display = True
+        try:
+            if self.raw_x is not None:
+                conv_x = _convert_value(self.raw_x, "мм", unit)
+                self.x_edit.setText(_format_dimension(conv_x, unit))
+            else:
+                self.x_edit.setText("—")
 
-        if self.raw_y is not None:
-            conv_y = _convert_value(self.raw_y, "мм", unit)
-            self.y_label.setText(_format_dimension(conv_y, unit))
-        else:
-            self.y_label.setText("—")
+            if self.raw_y is not None:
+                conv_y = _convert_value(self.raw_y, "мм", unit)
+                self.y_edit.setText(_format_dimension(conv_y, unit))
+            else:
+                self.y_edit.setText("—")
 
-        if self.raw_z is not None:
-            conv_z = _convert_value(self.raw_z, "мм", unit)
-            self.z_label.setText(_format_dimension(conv_z, unit))
-        else:
-            self.z_label.setText("—")
-
-        # Необходимые линейные размеры (по умолчанию те же значения)
-        if self.needed_x is not None:
-            conv_nx = _convert_value(self.needed_x, "мм", unit)
-            self.needed_x_label.setText(_format_dimension(conv_nx, unit))
-        else:
-            self.needed_x_label.setText("—")
-
-        if self.needed_y is not None:
-            conv_ny = _convert_value(self.needed_y, "мм", unit)
-            self.needed_y_label.setText(_format_dimension(conv_ny, unit))
-        else:
-            self.needed_y_label.setText("—")
-
-        if self.needed_z is not None:
-            conv_nz = _convert_value(self.needed_z, "мм", unit)
-            self.needed_z_label.setText(_format_dimension(conv_nz, unit))
-        else:
-            self.needed_z_label.setText("—")
+            if self.raw_z is not None:
+                conv_z = _convert_value(self.raw_z, "мм", unit)
+                self.z_edit.setText(_format_dimension(conv_z, unit))
+            else:
+                self.z_edit.setText("—")
+        finally:
+            self._updating_display = False
 
         # Площадь
         if self.raw_area is not None:
@@ -428,10 +409,85 @@ class BoundingBoxApp(QMainWindow):
         self.raw_z = None
         self.raw_area = None
         self.raw_volume = None
+        
+        # Отключаем поля для редактирования
+        if hasattr(self, 'x_edit'):
+            self.x_edit.setReadOnly(True)
+            self.x_edit.setEnabled(False)
+            self.y_edit.setReadOnly(True)
+            self.y_edit.setEnabled(False)
+            self.z_edit.setReadOnly(True)
+            self.z_edit.setEnabled(False)
+        
+        # Отключаем кнопку восстановления
+        if hasattr(self, 'restore_button'):
+            self.restore_button.setEnabled(False)
 
     def _update_units(self, unit):
         self.unit_var = unit
         self._update_display()
+
+    def _on_dimension_changed(self, attr):
+        """Обработчик изменения одного из размеров в полях ввода"""
+        if self._updating_display:
+            return
+            
+        if self.base_raw_x is None or self.base_raw_y is None or self.base_raw_z is None:
+            return
+            
+        # Получаем текущее значение из поля ввода
+        edit_widget = getattr(self, f"{attr}_edit")
+        text = edit_widget.text().strip()
+        if not text or text == "—":
+            return
+            
+        try:
+            # Парсим введённое значение (уже в текущих единицах)
+            entered_value = float(text.replace(',', '.'))
+        except ValueError:
+            return
+            
+        # Вычисляем базовые значения в текущих единицах (для точного сравнения)
+        unit = self.unit_var
+        base_x_display = _convert_value(self.base_raw_x, "мм", unit)
+        base_y_display = _convert_value(self.base_raw_y, "мм", unit)
+        base_z_display = _convert_value(self.base_raw_z, "мм", unit)
+        
+        # Вычисляем коэффициент изменения на основе отображаемых значений
+        if attr == "x":
+            ratio = entered_value / base_x_display
+            self.raw_x = self.base_raw_x * ratio
+            self.raw_y = self.base_raw_y * ratio
+            self.raw_z = self.base_raw_z * ratio
+        elif attr == "y":
+            ratio = entered_value / base_y_display
+            self.raw_x = self.base_raw_x * ratio
+            self.raw_y = self.base_raw_y * ratio
+            self.raw_z = self.base_raw_z * ratio
+        elif attr == "z":
+            ratio = entered_value / base_z_display
+            self.raw_x = self.base_raw_x * ratio
+            self.raw_y = self.base_raw_y * ratio
+            self.raw_z = self.base_raw_z * ratio
+            
+        # Обновляем площадь и объём пропорционально квадрату и кубу коэффициента
+        if self.base_raw_area is not None:
+            self.raw_area = self.base_raw_area * (ratio ** 2)
+        if self.base_raw_volume is not None:
+            self.raw_volume = self.base_raw_volume * (ratio ** 3)
+            
+        # Обновляем отображение
+        self._update_display()
+
+    def _restore_original(self):
+        """Восстановить исходные размеры из файла"""
+        if self.base_raw_x is not None:
+            self.raw_x = self.base_raw_x
+            self.raw_y = self.base_raw_y
+            self.raw_z = self.base_raw_z
+            self.raw_area = self.base_raw_area
+            self.raw_volume = self.base_raw_volume
+            self._update_display()
 
     def _init_viz_widget(self, parent_layout):
         self.viz_widget = QWidget()
@@ -466,6 +522,7 @@ class BoundingBoxApp(QMainWindow):
                 self.viz_interactor.GetRenderWindow().Render()
         else:
             self.viz_widget.setVisible(False)
+
 
 
 def main():
