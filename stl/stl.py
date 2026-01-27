@@ -5,30 +5,28 @@ import warnings
 warnings.filterwarnings('ignore', category=RuntimeWarning)
 
 
-# ========== Optimized versions ==========
-
 def _is_binary_stl_fast(filename):
-    """Fast binary STL detection."""
+    """Быстрое определение бинарного STL."""
     import os
     file_size = os.path.getsize(filename)
     
-    # Quick check: if file size < 84 bytes, can't be binary
+    # Быстрая проверка: если размер файла < 84 байт, не может быть бинарным
     if file_size < 84:
         return False
-    
+
     with open(filename, 'rb') as f:
         header = f.read(80)
-        # Check if header contains non-ASCII characters
+        # Проверка, содержит ли заголовок не-ASCII символы
         try:
             header.decode('ascii')
-            # If decodes successfully, check for 'solid' at beginning
+            # Если декодируется успешно, проверка на 'solid' в начале
             if header[:5].lower() == b'solid':
-                # Might still be binary if size matches binary format
+                # Может быть бинарным, если размер соответствует бинарному формату
                 pass
         except UnicodeDecodeError:
             return True
-        
-        # Check binary structure
+
+        # Проверка бинарной структуры
         f.seek(80)
         num_triangles_bytes = f.read(4)
         if len(num_triangles_bytes) < 4:
@@ -38,45 +36,322 @@ def _is_binary_stl_fast(filename):
         return file_size == expected_size
 
 
-def _parse_stl_binary_vectorized(filename):
-    """Parse binary STL with vectorized output."""
+def _parse_stl_binary_streaming(filename, progress_callback=None, chunk_size=500000):
+    """
+    Разбор бинарного STL с потоковой обработкой для больших файлов.
+    Возвращает: (max_area_info, unique_vertices, total_triangles)
+    где max_area_info = (max_area, max_index, max_normal, max_vertices)
+    """
+    import os
+    
+    file_size = os.path.getsize(filename)
+    
     with open(filename, 'rb') as f:
-        f.read(80)  # Skip header
+        # Чтение заголовка и количества треугольников
+        f.read(80)  # Пропустить заголовок
+        num_triangles_bytes = f.read(4)
+        num_triangles = struct.unpack('I', num_triangles_bytes)[0]
+
+    # Отображение файла в память для доступа без копирования
+    mmap = np.memmap(filename, dtype=np.uint8, mode='r')
+
+    # Пропустить заголовок (80 байт) и количество треугольников (4 байта)
+    data_offset = 84
+
+    # Инициализация переменных отслеживания
+    max_area = 0.0
+    max_index = -1
+    max_normal = None
+    max_vertices = None
+
+    # Сбор вершин порциями
+    vertex_chunks = []
+
+    # Обработка порциями для контроля использования памяти
+    for chunk_start in range(0, num_triangles, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, num_triangles)
+        chunk_size_current = chunk_end - chunk_start
+
+        # Вычисление байтовых смещений для этой порции
+        chunk_byte_start = data_offset + chunk_start * 50
+        chunk_byte_end = data_offset + chunk_end * 50
+
+        # Извлечение данных порции в виде структурированного массива - намного быстрее
+        chunk_data = np.frombuffer(
+            mmap[chunk_byte_start:chunk_byte_end],
+            dtype=np.dtype([
+                ('normal', '3f4'),
+                ('v1', '3f4'),
+                ('v2', '3f4'),
+                ('v3', '3f4'),
+                ('attr', 'u2')
+            ])
+        )
+
+        # Извлечение всех вершин из этой порции (chunk_size_current * 3 вершины)
+        # Преобразование для получения всех вершин в виде массива (chunk_size_current * 3, 3)
+        vertices_chunk = np.column_stack([
+            chunk_data['v1'].reshape(-1, 1),
+            chunk_data['v1'].reshape(-1, 1),
+            chunk_data['v1'].reshape(-1, 1)
+        ])
+
+        # На самом деле, нужно получить v1, v2, v3 отдельно
+        # Создание массива со всеми вершинами из этой порции
+        vertices_all = np.zeros((chunk_size_current * 3, 3), dtype=np.float32)
+        vertices_all[0::3] = chunk_data['v1']
+        vertices_all[1::3] = chunk_data['v2']
+        vertices_all[2::3] = chunk_data['v3']
+
+        # Округление вершин для удаления дубликатов и добавление в порции
+        vertices_rounded = np.round(vertices_all, 6)
+        vertex_chunks.append(vertices_rounded)
+
+        # Обработка треугольников для поиска максимальной площади (векторно)
+        # Вычисление площадей для всех треугольников в этой порции
+        v1 = chunk_data['v1']
+        v2 = chunk_data['v2']
+        v3 = chunk_data['v3']
+
+        edge1 = v2 - v1
+        edge2 = v3 - v1
+        cross = np.cross(edge1, edge2)
+        areas = 0.5 * np.linalg.norm(cross, axis=1)
+
+        # Поиск максимальной площади в этой порции
+        chunk_max_idx = np.argmax(areas)
+        chunk_max_area = areas[chunk_max_idx]
+
+        # Обновление глобального максимума
+        if chunk_max_area > max_area:
+            max_area = chunk_max_area
+            max_index = chunk_start + chunk_max_idx
+            max_normal = chunk_data[chunk_max_idx]['normal'].copy()
+            max_vertices = np.array([
+                v1[chunk_max_idx],
+                v2[chunk_max_idx],
+                v3[chunk_max_idx]
+            ])
+
+        # Сообщение о прогрессе
+        if progress_callback:
+            progress = (chunk_end / num_triangles) * 100
+            progress_callback(progress, f"Processing triangles: {chunk_end:,}/{num_triangles:,}")
+    
+    # Объединение и удаление дубликатов вершин
+    if vertex_chunks:
+        # Конкатенация всех вершин
+        all_vertices = np.concatenate(vertex_chunks, axis=0)
+        # Использование numpy unique для удаления дубликатов (намного быстрее, чем Python set)
+        unique_vertices = np.unique(all_vertices, axis=0)
+    else:
+        unique_vertices = np.zeros((0, 3), dtype=np.float32)
+
+    # Создание словаря с информацией о максимальном треугольнике
+    max_triangle_info = {
+        'max_area': max_area,
+        'max_index': max_index,
+        'max_normal': max_normal,
+        'max_vertices': max_vertices,
+    }
+
+    return max_triangle_info, unique_vertices, num_triangles
+
+
+def _calculate_triangle_area_from_vertices(v1, v2, v3):
+    """Вычисление площади треугольника по трем вершинам."""
+    edge1 = v2 - v1
+    edge2 = v3 - v1
+    cross = np.cross(edge1, edge2)
+    return 0.5 * np.linalg.norm(cross)
+
+
+def calculate_parallelepiped_volume_streaming(filename, progress_callback=None):
+    """
+    Экономная версия для больших STL файлов (>1M треугольников).
+    Использует потоковый разбор с отображением в память.
+    """
+    import numpy as np
+    import time
+    
+    if progress_callback:
+        progress_callback(0, "Starting STL processing...")
+
+    start_time = time.time()
+
+    # Использование потокового парсера
+    max_info, unique_vertices, total_triangles = _parse_stl_binary_streaming(
+        filename, progress_callback=progress_callback
+    )
+
+    if progress_callback:
+        progress_callback(50, "Finding bounding box...")
+
+    # Извлечение информации о максимальном треугольнике
+    max_area = max_info['max_area']
+    max_index = max_info['max_index']
+    max_normal = max_info['max_normal']
+    max_vertices = max_info['max_vertices']
+
+    # Создание системы координат из максимального треугольника
+    v1, v2, v3 = max_vertices
+    edge1 = v2 - v1
+    edge2 = v3 - v1
+    normal_vector = np.cross(edge1, edge2)
+    origin = v1
+
+    # Вычисление выровненного ограничивающего бокса с использованием уникальных вершин
+    if len(unique_vertices) == 0:
+        return None
+
+    # Использование оптимизированного вычисления ограничивающего бокса
+    min_coords, max_coords, rotation_matrix = calculate_aligned_bounding_box_optimized_large(
+        unique_vertices, normal_vector, origin
+    )
+
+    dimensions = max_coords - min_coords
+    volume = dimensions[0] * dimensions[1] * dimensions[2]
+
+    # Создание словаря максимального треугольника для совместимости
+    max_triangle_dict = {
+        'normal': max_normal.tolist(),
+        'vertices': max_vertices.tolist()
+    }
+
+    end_time = time.time()
+
+    if progress_callback:
+        progress_callback(100, f"Completed in {end_time - start_time:.1f} seconds")
+    
+    return {
+        'total_triangles': total_triangles,
+        'max_triangle_index': max_index,
+        'max_triangle_area': max_area,
+        'max_triangle': max_triangle_dict,
+        'min_coords': min_coords,
+        'max_coords': max_coords,
+        'dimensions': dimensions,
+        'volume': volume,
+        'rotation_matrix': rotation_matrix,
+        'origin': origin.tolist(),
+    }
+
+
+def calculate_aligned_bounding_box_optimized_large(unique_vertices, normal_vector, origin):
+    """
+    Оптимизированное вычисление ограничивающего бокса для больших наборов вершин.
+    Использует приближение выпуклой оболочки для скорости.
+    """
+    if len(unique_vertices) == 0:
+        return np.zeros(3), np.zeros(3), np.eye(3)
+    
+    # Нормализация нормали
+    z_axis = normal_vector / np.linalg.norm(normal_vector)
+
+    # Проекция вершин на плоскость, перпендикулярную нормали
+    v_translated = unique_vertices - origin
+    projection_lengths = np.dot(v_translated, z_axis)
+
+    # Использование трансляции для эффективности
+    projection_lengths_3d = projection_lengths[:, np.newaxis]
+    projected_2d = v_translated - projection_lengths_3d * z_axis
+
+    # Для очень больших наборов, выборка для выпуклой оболочки
+    if len(projected_2d) > 10000:
+        # Использование случайной выборки для приближения выпуклой оболочки
+        sample_indices = np.random.choice(len(projected_2d), size=10000, replace=False)
+        hull_points_2d = compute_convex_hull_2d(projected_2d[sample_indices, :2])
+    else:
+        hull_points_2d = compute_convex_hull_2d(projected_2d[:, :2])
+
+    if len(hull_points_2d) == 0:
+        return np.zeros(3), np.zeros(3), np.eye(3)
+
+    # Поиск минимального прямоугольника с использованием вращающихся штангенциркулей
+    min_area, angle, width, height = rotating_calipers_min_area_rectangle(hull_points_2d)
+
+    # Создание матрицы вращения для оптимальной ориентации
+    temp = np.array([1.0, 0.0, 0.0]) if abs(z_axis[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    x_base = np.cross(z_axis, temp)
+    x_base = x_base / np.linalg.norm(x_base)
+    y_base = np.cross(z_axis, x_base)
+    y_base = y_base / np.linalg.norm(y_base)
+
+    # Оптимальное вращение в плоскости
+    x_axis = np.cos(angle) * x_base + np.sin(angle) * y_base
+    y_axis = -np.sin(angle) * x_base + np.cos(angle) * y_base
+
+    # Итоговая матрица вращения
+    best_rotation = np.column_stack([x_axis, y_axis, z_axis])
+
+    # Трансформация всех вершин для нахождения экстентов
+    transformed = np.dot(unique_vertices - origin, best_rotation)
+    min_coords = transformed.min(axis=0)
+    max_coords = transformed.max(axis=0)
+    
+    return min_coords, max_coords, best_rotation
+
+
+def get_bounding_box_dimensions_streaming(filename, *, aligned=True, progress_callback=None):
+    """Потоковая версия get_bounding_box_dimensions."""
+    if not aligned:
+        # Для невращаемого бокса
+        max_info, unique_vertices, total_triangles = _parse_stl_binary_streaming(
+            filename, progress_callback=progress_callback
+        )
+        if len(unique_vertices) == 0:
+            return None
+        min_coords = unique_vertices.min(axis=0)
+        max_coords = unique_vertices.max(axis=0)
+        dimensions = max_coords - min_coords
+        return dimensions[0], dimensions[1], dimensions[2]
+    else:
+        result = calculate_parallelepiped_volume_streaming(filename, progress_callback)
+        if not result:
+            return None
+        dims = result['dimensions']
+        return dims[0], dims[1], dims[2]
+
+
+def _parse_stl_binary_vectorized(filename):
+    """Разбор бинарного STL с векторизованным выводом."""
+    with open(filename, 'rb') as f:
+        f.read(80)  # Пропустить заголовок
         num_triangles = struct.unpack('I', f.read(4))[0]
-        
-        # Pre-allocate arrays
+
+        # Предварительное выделение массивов
         vertices = np.zeros((num_triangles, 3, 3), dtype=np.float32)
         normals = np.zeros((num_triangles, 3), dtype=np.float32)
-        
+
         for i in range(num_triangles):
-            # Read normal (3 floats)
+            # Чтение нормали (3 float)
             normal = struct.unpack('fff', f.read(12))
             normals[i] = normal
-            
-            # Read vertices (9 floats)
+
+            # Чтение вершин (9 float)
             v1 = struct.unpack('fff', f.read(12))
             v2 = struct.unpack('fff', f.read(12))
             v3 = struct.unpack('fff', f.read(12))
             vertices[i, 0] = v1
             vertices[i, 1] = v2
             vertices[i, 2] = v3
-            
-            # Skip attribute bytes
+
+            # Пропуск байтов атрибутов
             f.read(2)
-        
-        # Create compatibility dicts
+
+        # Создание словарей для совместимости
         triangles = []
         for i in range(num_triangles):
             triangles.append({
                 'normal': normals[i].tolist(),
                 'vertices': vertices[i].tolist()
             })
-        
+
         return vertices, triangles
 
 
 def _parse_stl_ascii_vectorized(filename):
-    """Parse ASCII STL with vectorized output."""
+    """Разбор ASCII STL с векторизованным выводом."""
     vertices_list = []
     normals_list = []
     triangles = []
@@ -119,53 +394,47 @@ def _parse_stl_ascii_vectorized(filename):
 
 def parse_stl_vectorized(filename):
     """
-    Parse STL file and return vertices as numpy arrays.
-    Returns: (vertices, triangles) where:
-        vertices: (n, 3, 3) array of triangle vertices
-        triangles: list of original dicts for compatibility
+    Разбор STL файла и возврат вершин в виде numpy массивов.
+    Возвращает: (vertices, triangles) где:
+        vertices: (n, 3, 3) массив вершин треугольников
+        triangles: список оригинальных словарей для совместимости
     """
     import time
     start_time = time.time()
 
-    if _is_binary_stl_fast(filename):
-        tmp = _parse_stl_binary_vectorized(filename)
-        print("--- %s seconds ---" % (time.time() - start_time))
-        return tmp
-        # return _parse_stl_binary_vectorized(filename)
-    else:
-        tmp = _parse_stl_ascii_vectorized(filename)
-        print("--- %s seconds ---" % (time.time() - start_time))
-        return tmp
-        # return _parse_stl_ascii_vectorized(filename)
+    file_output = _parse_stl_binary_vectorized(filename) if _is_binary_stl_fast(filename) else _parse_stl_ascii_vectorized(filename)
+
+    print("---Парсинг: %s секунд ---" % (time.time() - start_time))
+    return file_output
 
 
 def calculate_triangle_areas_vectorized(vertices):
     """
-    Calculate triangle areas using vectorized operations.
-    vertices: (n, 3, 3) array where vertices[i, j] is j-th vertex of i-th triangle
-    Returns: (n,) array of areas
+    Вычисление площадей треугольников с использованием векторизованных операций.
+    vertices: (n, 3, 3) массив где vertices[i, j] - это j-я вершина i-го треугольника
+    Возвращает: (n,) массив площадей
     """
-    # Edge vectors
+    # Векторы ребер
     v1 = vertices[:, 0]  # (n, 3)
     v2 = vertices[:, 1]  # (n, 3)
     v3 = vertices[:, 2]  # (n, 3)
-    
+
     edge1 = v2 - v1  # (n, 3)
     edge2 = v3 - v1  # (n, 3)
-    
-    # Cross product
+
+    # Векторное произведение
     cross = np.cross(edge1, edge2)  # (n, 3)
-    
-    # Area = 0.5 * norm of cross product
+
+    # Площадь = 0.5 * норма векторного произведения
     areas = 0.5 * np.linalg.norm(cross, axis=1)  # (n,)
-    
+
     return areas
 
 
 def find_max_area_triangle_vectorized(vertices):
     """
-    Find triangle with maximum area.
-    Returns: (max_area, max_index, max_triangle_vertices)
+    Поиск треугольника с максимальной площадью.
+    Возвращает: (max_area, max_index, max_triangle_vertices)
     """
     if vertices.shape[0] == 0:
         return 0.0, -1, None
@@ -180,185 +449,200 @@ def find_max_area_triangle_vectorized(vertices):
 
 def create_coordinate_system_from_triangle_vectorized(triangle_vertices):
     """
-    Create orthonormal coordinate system from triangle.
-    triangle_vertices: (3, 3) array of vertices
-    Returns: (rotation_matrix, origin)
+    Создание ортонормированной системы координат из треугольника.
+    triangle_vertices: (3, 3) массив вершин
+    Возвращает: (rotation_matrix, origin)
     """
     v1, v2, v3 = triangle_vertices
-    
-    # Edge vectors
+
+    # Векторы ребер
     edge1 = v2 - v1
     edge2 = v3 - v1
-    
-    # Z-axis: normal to plane
+
+    # Ось Z: нормаль к плоскости
     z_axis = np.cross(edge1, edge2)
     z_norm = np.linalg.norm(z_axis)
     if z_norm < 1e-10:
-        # Degenerate triangle, use default axes
+        # Вырожденный треугольник, использовать оси по умолчанию
         return np.eye(3), v1
-    
+
     z_axis = z_axis / z_norm
-    
-    # X-axis: along first edge
+
+    # Ось X: вдоль первого ребра
     x_axis = edge1
     x_norm = np.linalg.norm(x_axis)
     if x_norm < 1e-10:
-        # Edge too short, use arbitrary perpendicular vector
+        # Ребро слишком короткое, использовать произвольный перпендикулярный вектор
         if abs(z_axis[0]) < 0.9:
             temp = np.array([1.0, 0.0, 0.0])
         else:
             temp = np.array([0.0, 1.0, 0.0])
         x_axis = np.cross(z_axis, temp)
         x_norm = np.linalg.norm(x_axis)
-    
+
     x_axis = x_axis / x_norm
-    
-    # Y-axis: perpendicular to X and Z
+
+    # Ось Y: перпендикулярна X и Z
     y_axis = np.cross(z_axis, x_axis)
     y_norm = np.linalg.norm(y_axis)
     if y_norm < 1e-10:
-        # Should not happen with proper normalization
+        # Не должно происходить при правильной нормализации
         y_axis = np.array([0.0, 0.0, 1.0])
     else:
         y_axis = y_axis / y_norm
-    
-    # Rotation matrix (columns are basis vectors)
+
+    # Матрица вращения (столбцы - базисные векторы)
     rotation_matrix = np.column_stack([x_axis, y_axis, z_axis])
-    
+
     return rotation_matrix, v1
 
 
 def compute_convex_hull_2d(points):
     """
-    Compute 2D convex hull of points using SciPy.
-    points: (n, 2) array of 2D points
-    Returns: hull_points (m, 2) array of hull vertices in counterclockwise order
+    Вычисление 2D выпуклой оболочки точек с использованием SciPy.
+    points: (n, 2) массив 2D точек
+    Возвращает: hull_points (m, 2) массив вершин оболочки в порядке против часовой стрелки
     """
     if len(points) < 3:
         return points
-    
+
     try:
         hull = ConvexHull(points)
         return points[hull.vertices]
     except:
-        # Fallback: return original points if hull fails
+        # Резервный вариант: вернуть оригинальные точки, если оболочка не удалась
         return points
 
 
 def rotating_calipers_min_area_rectangle(points):
     """
-    Find minimum area bounding rectangle using rotating calipers algorithm.
-    points: (n, 2) array of convex hull points in CCW order
-    Returns: (min_area, rotation_angle, width, height)
+    Поиск прямоугольника минимальной площади с использованием алгоритма вращающихся штангенциркулей.
+    points: (n, 2) массив точек выпуклой оболочки в порядке против часовой стрелки
+    Возвращает: (min_area, rotation_angle, width, height)
     """
     n = len(points)
     if n < 2:
         return 0.0, 0.0, 0.0, 0.0
-    
-    # Initialize calipers
+
+    # Инициализация штангенциркулей
     min_area = float('inf')
     best_angle = 0.0
     best_width = 0.0
     best_height = 0.0
-    
-    # For each edge as base direction
+
+    # Для каждого ребра как базового направления
     for i in range(n):
-        # Current edge direction
+        # Текущее направление ребра
         p1 = points[i]
         p2 = points[(i + 1) % n]
         edge_dir = p2 - p1
         edge_len = np.linalg.norm(edge_dir)
-        
+
         if edge_len < 1e-10:
             continue
-        
-        # Unit direction vector
+
+        # Единичный вектор направления
         u = edge_dir / edge_len
-        
-        # Perpendicular vector
+
+        # Перпендикулярный вектор
         v = np.array([-u[1], u[0]])
-        
-        # Project all points onto u and v axes
+
+        # Проекция всех точек на оси u и v
         proj_u = np.dot(points, u)
         proj_v = np.dot(points, v)
-        
-        # Calculate extents
+
+        # Вычисление экстентов
         u_min, u_max = proj_u.min(), proj_u.max()
         v_min, v_max = proj_v.min(), proj_v.max()
-        
+
         width = u_max - u_min
         height = v_max - v_min
         area = width * height
-        
+
         if area < min_area:
             min_area = area
             best_angle = np.arctan2(u[1], u[0])
             best_width = width
             best_height = height
-    
+
     return min_area, best_angle, best_width, best_height
 
 
 def calculate_aligned_bounding_box_optimized(vertices, normal_vector, origin):
     """
-    Optimized bounding box calculation using convex hull and rotating calipers.
+    Оптимизированное вычисление ограничивающего бокса с использованием выпуклой оболочки и вращающихся штангенциркулей.
+    Возвращает размеры, отсортированные по размеру: (наибольший, средний, наименьший)
     """
     if vertices.shape[0] == 0:
         return np.zeros(3), np.zeros(3), np.eye(3)
-    
-    # Normalize normal
+
+    # Нормализация нормали
     z_axis = normal_vector / np.linalg.norm(normal_vector)
-    
-    # Extract all unique vertices (much faster than original)
-    # Reshape to (n*3, 3) and use unique
+
+    # Извлечение всех уникальных вершин
+    # Преобразование в (n*3, 3) и использование unique
     all_vertices = vertices.reshape(-1, 3)
-    
-    # Use rounding to reduce duplicates (faster than set of tuples)
+
+    # Использование округления для уменьшения дубликатов
     rounded_vertices = np.round(all_vertices, decimals=6)
     unique_vertices = np.unique(rounded_vertices, axis=0)
-    
-    # Project vertices onto plane perpendicular to normal
-    # Vectorized projection
+
+    # Проекция вершин на плоскость, перпендикулярную нормали
     v_translated = unique_vertices - origin
     projection_lengths = np.dot(v_translated, z_axis)
-    
-    # Use broadcasting for efficiency
+
     projection_lengths_3d = projection_lengths[:, np.newaxis]
-    projected_2d = v_translated - projection_lengths_3d * z_axis
-    
-    # Compute 2D convex hull
-    hull_points_2d = compute_convex_hull_2d(projected_2d[:, :2])  # Use only x,y
-    
-    if len(hull_points_2d) == 0:
-        return np.zeros(3), np.zeros(3), np.eye(3)
-    
-    # Find minimal rectangle using rotating calipers
-    min_area, angle, width, height = rotating_calipers_min_area_rectangle(hull_points_2d)
-    
-    # Create rotation matrix for optimal orientation
-    # Base axes in plane
-    temp = np.array([1.0, 0.0, 0.0]) if abs(z_axis[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    projected_3d = v_translated - projection_lengths_3d * z_axis
+
+    # Создание ортонормированного базиса для плоскости
+    # Выбор произвольного вектора, перпендикулярного z_axis для x_base
+    if abs(z_axis[0]) < 0.9:
+        temp = np.array([1.0, 0.0, 0.0])
+    else:
+        temp = np.array([0.0, 1.0, 0.0])
     x_base = np.cross(z_axis, temp)
     x_base = x_base / np.linalg.norm(x_base)
     y_base = np.cross(z_axis, x_base)
     y_base = y_base / np.linalg.norm(y_base)
-    
-    # Optimal rotation in plane
+
+    # Проекция 3D точек на 2D плоскость с использованием базиса плоскости
+    x_coords = np.dot(projected_3d, x_base)
+    y_coords = np.dot(projected_3d, y_base)
+    projected_2d = np.column_stack([x_coords, y_coords])
+
+    # Вычисление 2D выпуклой оболочки
+    hull_points_2d = compute_convex_hull_2d(projected_2d)
+
+    if len(hull_points_2d) == 0:
+        return np.zeros(3), np.zeros(3), np.eye(3)
+
+    # Поиск минимального прямоугольника с использованием алг. вращающихся калиперов
+    min_area, angle, width, height = rotating_calipers_min_area_rectangle(hull_points_2d)
+
+    # Создание матрицы вращения для оптимальной ориентации в плоскости
     x_axis = np.cos(angle) * x_base + np.sin(angle) * y_base
     y_axis = -np.sin(angle) * x_base + np.cos(angle) * y_base
-    
-    # Final rotation matrix
+
+    # Итоговая матрица вращения
     best_rotation = np.column_stack([x_axis, y_axis, z_axis])
-    
-    # Transform all vertices to find extents
+
+    # Трансформация всех вершин для нахождения экстентов
     transformed = np.dot(unique_vertices - origin, best_rotation)
     min_coords = transformed.min(axis=0)
     max_coords = transformed.max(axis=0)
-    
-    return min_coords, max_coords, best_rotation
+    dimensions = max_coords - min_coords
 
+    # Сортировка размеров по размеру (наибольший первым) для обеспечения согласованного порядка
+    sorted_indices = np.argsort(-np.abs(dimensions))  # Отрицательное для убывания
+    dimensions_sorted = dimensions[sorted_indices]
+    min_coords_sorted = min_coords[sorted_indices]
+    max_coords_sorted = max_coords[sorted_indices]
 
-# ========== Original API compatibility ==========
+    # Также переупорядочивание столбцов матрицы вращения для соответствия отсортированным размерам
+    rotation_sorted = best_rotation[:, sorted_indices]
+
+    return min_coords_sorted, max_coords_sorted, rotation_sorted
+
 
 def parse_stl_ascii(filename):
     """Разбор ASCII STL и возврат списка треугольников."""
@@ -456,7 +740,6 @@ def calculate_aligned_bounding_box(triangles, normal_vector, origin):
     Минимальный бокс, у которого одна грань перпендикулярна normal_vector.
     Ищется оптимальный поворот в плоскости.
     """
-    # Уникальные вершины для снижения дубликатов
     unique_vertices = set()
     for triangle in triangles:
         for vertex in triangle["vertices"]:
@@ -543,33 +826,32 @@ def calculate_parallelepiped_volume(filename):
     Объём минимального параллелепипеда, ориентированного по плоскости
     треугольника максимальной площади.
     """
-    # Use optimized implementation
+    # Использование оптимизированной реализации
     vertices, triangles = parse_stl_vectorized(filename)
     total_triangles = vertices.shape[0]
-    
+
     if total_triangles == 0:
         return None
-    
-    # Find max area triangle (vectorized)
+
+    # Поиск треугольника с максимальной площадью
     max_area, max_index, max_triangle_vertices = find_max_area_triangle_vectorized(vertices)
-    
-    # Create coordinate system from max triangle
+
+    # Создание системы координат из максимального треугольника
     v1, v2, v3 = max_triangle_vertices
     edge1 = v2 - v1
     edge2 = v3 - v1
     normal_vector = np.cross(edge1, edge2)
-    
-    # Calculate aligned bounding box (optimized)
+
+    # Вычисление выровненного ограничивающего бокса (оптимизированно)
     min_coords, max_coords, rotation_matrix = calculate_aligned_bounding_box_optimized(
         vertices, normal_vector, v1
     )
-    
+
     dimensions = max_coords - min_coords
     volume = dimensions[0] * dimensions[1] * dimensions[2]
-    
-    # Create compatibility dict
+
     max_triangle_dict = triangles[max_index]
-    
+
     return {
         "total_triangles": total_triangles,
         "max_triangle_index": max_index,

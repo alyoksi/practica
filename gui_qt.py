@@ -26,7 +26,7 @@ try:
     from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
     VTK_QT_AVAILABLE = True
 except ImportError:
-    print("VTK Qt integration not available, STL visualization disabled")
+    print("Интеграция VTK в Qt недоступна, STL визуализация выключена")
     VTK_QT_AVAILABLE = False
     QVTKRenderWindowInteractor = None
 
@@ -99,7 +99,6 @@ class BoundingBoxApp(QMainWindow):
         self.x_value = "—"
         self.y_value = "—"
         self.z_value = "—"
-        self.area_value = "—"
         self.volume_value = "—"
         self.unit_var = "мм"
 
@@ -107,14 +106,12 @@ class BoundingBoxApp(QMainWindow):
         self.raw_x = None
         self.raw_y = None
         self.raw_z = None
-        self.raw_area = None
         self.raw_volume = None
 
         # Базовые (исходные) размеры для пропорций
         self.base_raw_x = None
         self.base_raw_y = None
         self.base_raw_z = None
-        self.base_raw_area = None
         self.base_raw_volume = None
 
         self.stl_module = stlmod
@@ -189,7 +186,6 @@ class BoundingBoxApp(QMainWindow):
         layout.addLayout(dims_layout)
 
         extras_layout = QHBoxLayout()
-        self._create_extra_block(extras_layout, "Площадь", "мм²", "area")
         self._create_extra_block(extras_layout, "Объём", "мм³", "volume")
         layout.addLayout(extras_layout)
 
@@ -202,7 +198,7 @@ class BoundingBoxApp(QMainWindow):
         unit_layout.addStretch()
         
         # Кнопка восстановления размеров
-        self.restore_button = QPushButton("Вернуть начальные размеры")
+        self.restore_button = QPushButton("Вернуть размеры модели")
         self.restore_button.clicked.connect(self._restore_original)
         self.restore_button.setEnabled(False)
         unit_layout.addWidget(self.restore_button)
@@ -218,7 +214,7 @@ class BoundingBoxApp(QMainWindow):
         frame_layout = QVBoxLayout(frame)
         frame_layout.setContentsMargins(8, 8, 8, 8)
 
-        # First line: axis and label
+        # Первая строка: ось и метка
         header_layout = QHBoxLayout()
         axis_label = QLabel(f"{axis} ({label})")
         axis_label.setStyleSheet("font-weight: bold;")
@@ -226,7 +222,7 @@ class BoundingBoxApp(QMainWindow):
         header_layout.addStretch()
         frame_layout.addLayout(header_layout)
 
-        # Second line: field and unit
+        # Вторая строка: поле и единица измерения
         field_layout = QHBoxLayout()
         value_edit = QLineEdit("—")
         value_edit.setStyleSheet("border: 1px solid; padding: 2px;")
@@ -246,7 +242,7 @@ class BoundingBoxApp(QMainWindow):
         setattr(self, f"{attr}_edit", value_edit)
         setattr(self, f"{attr}_unit_label", unit_label)
 
-        # Connect returnPressed signal (triggers only on Enter key press)
+        # Подключаем сигнал returnPressed (срабатывает только при нажатии Enter)
         value_edit.returnPressed.connect(
             lambda checked=False, a=attr: self._on_dimension_changed(a)
         )
@@ -258,7 +254,7 @@ class BoundingBoxApp(QMainWindow):
         frame_layout = QVBoxLayout(frame)
         frame_layout.setContentsMargins(8, 8, 8, 8)
 
-        # First line: name
+        # Первая строка: название
         header_layout = QHBoxLayout()
         name_label = QLabel(name)
         name_label.setStyleSheet("font-weight: bold;")
@@ -266,7 +262,7 @@ class BoundingBoxApp(QMainWindow):
         header_layout.addStretch()
         frame_layout.addLayout(header_layout)
 
-        # Second line: field and unit
+        # Вторая строка: поле и единица измерения
         field_layout = QHBoxLayout()
         value_label = QLabel("—")
         value_label.setStyleSheet("border: 1px solid; padding: 2px;")
@@ -312,9 +308,11 @@ class BoundingBoxApp(QMainWindow):
         self.status_label.setText("")
 
         try:
-            dims = self.stl_module.get_bounding_box_dimensions(file_path, aligned=True)
+            import time
+            transform_start_time = time.time()
             result = self.stl_module.calculate_parallelepiped_volume(file_path)
-            area = None
+            transform_end_time = time.time()
+            print("---Преобразование: %s секунд ---" % (transform_end_time - transform_start_time))
             volume = result["volume"] if result else None
         except Exception as exc:
             self.status_text = f"Ошибка чтения файла: {exc}"
@@ -323,7 +321,7 @@ class BoundingBoxApp(QMainWindow):
             self._update_display()
             return
 
-        if not dims:
+        if not result:
             self.status_text = "Не удалось вычислить габариты"
             self.status_label.setText(self.status_text)
             self._clear_raw()
@@ -331,13 +329,12 @@ class BoundingBoxApp(QMainWindow):
             return
 
         # Сохраняем сырые значения в мм
+        dims = result['dimensions']
         self.raw_x, self.raw_y, self.raw_z = dims
-        self.raw_area = area
         self.raw_volume = volume
 
         # Сохраняем базовые размеры для пропорций
         self.base_raw_x, self.base_raw_y, self.base_raw_z = dims
-        self.base_raw_area = area
         self.base_raw_volume = volume
 
         # Включаем поля для редактирования
@@ -363,7 +360,6 @@ class BoundingBoxApp(QMainWindow):
         self.x_unit_label.setText(unit)
         self.y_unit_label.setText(unit)
         self.z_unit_label.setText(unit)
-        self.area_unit_label.setText(f"{unit}²")
         self.volume_unit_label.setText(f"{unit}³")
 
         # Линейные размеры
@@ -389,13 +385,6 @@ class BoundingBoxApp(QMainWindow):
         finally:
             self._updating_display = False
 
-        # Площадь
-        if self.raw_area is not None:
-            conv_area = _convert_value(self.raw_area, "мм", unit, is_square=True)
-            self.area_label.setText(_format_dimension(conv_area, unit))
-        else:
-            self.area_label.setText("—")
-
         # Объём
         if self.raw_volume is not None:
             conv_volume = _convert_value(self.raw_volume, "мм", unit, is_cubic=True)
@@ -407,9 +396,8 @@ class BoundingBoxApp(QMainWindow):
         self.raw_x = None
         self.raw_y = None
         self.raw_z = None
-        self.raw_area = None
         self.raw_volume = None
-        
+
         # Отключаем поля для редактирования
         if hasattr(self, 'x_edit'):
             self.x_edit.setReadOnly(True)
@@ -418,7 +406,7 @@ class BoundingBoxApp(QMainWindow):
             self.y_edit.setEnabled(False)
             self.z_edit.setReadOnly(True)
             self.z_edit.setEnabled(False)
-        
+
         # Отключаем кнопку восстановления
         if hasattr(self, 'restore_button'):
             self.restore_button.setEnabled(False)
@@ -470,9 +458,7 @@ class BoundingBoxApp(QMainWindow):
             self.raw_y = self.base_raw_y * ratio
             self.raw_z = self.base_raw_z * ratio
             
-        # Обновляем площадь и объём пропорционально квадрату и кубу коэффициента
-        if self.base_raw_area is not None:
-            self.raw_area = self.base_raw_area * (ratio ** 2)
+        # Обновляем объём пропорционально кубу коэффициента
         if self.base_raw_volume is not None:
             self.raw_volume = self.base_raw_volume * (ratio ** 3)
             
@@ -485,7 +471,6 @@ class BoundingBoxApp(QMainWindow):
             self.raw_x = self.base_raw_x
             self.raw_y = self.base_raw_y
             self.raw_z = self.base_raw_z
-            self.raw_area = self.base_raw_area
             self.raw_volume = self.base_raw_volume
             self._update_display()
 
@@ -496,6 +481,8 @@ class BoundingBoxApp(QMainWindow):
 
     def _setup_visualization(self, extension, file_path, result):
         if extension == ".stl" and VTK_QT_AVAILABLE:
+            import time
+            viz_start_time = time.time()
             if not self.visualizer:
                 self.visualizer = visualizer.STLVisualizer()
             if not self.viz_interactor:
@@ -520,6 +507,8 @@ class BoundingBoxApp(QMainWindow):
             self.viz_widget.setVisible(True)
             if self.viz_interactor:
                 self.viz_interactor.GetRenderWindow().Render()
+            viz_end_time = time.time()
+            print("---Визуализация: %s секунд ---" % (viz_end_time - viz_start_time))
         else:
             self.viz_widget.setVisible(False)
 
