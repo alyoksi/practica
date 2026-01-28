@@ -115,6 +115,7 @@ class BoundingBoxApp(QMainWindow):
         self.base_raw_volume = None
 
         self.stl_module = stlmod
+        self.clipboard = QApplication.clipboard()
 
         self.visualizer = None
         self.viz_interactor = None
@@ -196,14 +197,25 @@ class BoundingBoxApp(QMainWindow):
         self.unit_combo.currentTextChanged.connect(self._update_units)
         unit_layout.addWidget(self.unit_combo)
         unit_layout.addStretch()
-        
+
+        layout.addLayout(unit_layout)
+
+        button_layout = QHBoxLayout()
+        button_layout.addStretch()
+
+        # Кнопка копирования размеров
+        self.copy_button = QPushButton("Копировать размеры")
+        self.copy_button.clicked.connect(self._copy_sizes)
+        self.copy_button.setEnabled(False)
+        button_layout.addWidget(self.copy_button)
+
         # Кнопка восстановления размеров
         self.restore_button = QPushButton("Вернуть размеры модели")
         self.restore_button.clicked.connect(self._restore_original)
         self.restore_button.setEnabled(False)
-        unit_layout.addWidget(self.restore_button)
-        
-        layout.addLayout(unit_layout)
+        button_layout.addWidget(self.restore_button)
+
+        layout.addLayout(button_layout)
 
         layout.addStretch()
 
@@ -348,6 +360,9 @@ class BoundingBoxApp(QMainWindow):
         # Включаем кнопку восстановления
         self.restore_button.setEnabled(True)
 
+        # Включаем кнопку копирования
+        self.copy_button.setEnabled(True)
+
         self._update_display()
 
         # Setup visualization if STL
@@ -411,6 +426,10 @@ class BoundingBoxApp(QMainWindow):
         if hasattr(self, 'restore_button'):
             self.restore_button.setEnabled(False)
 
+        # Отключаем кнопку копирования
+        if hasattr(self, 'copy_button'):
+            self.copy_button.setEnabled(False)
+
     def _update_units(self, unit):
         self.unit_var = unit
         self._update_display()
@@ -473,6 +492,17 @@ class BoundingBoxApp(QMainWindow):
             self.raw_z = self.base_raw_z
             self.raw_volume = self.base_raw_volume
             self._update_display()
+
+    def _copy_sizes(self):
+        """Копировать размеры модели в буфер обмена"""
+        if self.raw_x is None or self.raw_y is None or self.raw_z is None:
+            return
+        unit = self.unit_var
+        x_val = _convert_value(self.raw_x, "мм", unit)
+        y_val = _convert_value(self.raw_y, "мм", unit)
+        z_val = _convert_value(self.raw_z, "мм", unit)
+        text = f"{x_val:.2f}\t{y_val:.2f}\t{z_val:.2f}"
+        self.clipboard.setText(text)
 
     def _init_viz_widget(self, parent_layout):
         self.viz_widget = QWidget()
