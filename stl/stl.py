@@ -3,6 +3,351 @@ import numpy as np
 from scipy.spatial import ConvexHull
 import warnings
 warnings.filterwarnings('ignore', category=RuntimeWarning)
+import collections
+import math
+
+
+def _edge_plane_intersections(va, vb, da, db, eps):
+    """Вычислить точки пересечения ребра с плоскостью для массива рёбер."""
+    near_a = np.abs(da) <= eps
+    near_b = np.abs(db) <= eps
+    edge_mask = (da * db < 0) | near_a | near_b
+    edge_mask &= ~(near_a & near_b)
+    denom = da - db
+    valid = edge_mask & (np.abs(denom) > eps)
+    t = np.zeros_like(da)
+    t[valid] = da[valid] / denom[valid]
+    pts = va + (vb - va) * t[:, np.newaxis]
+    pts_2d = pts[:, :2]
+    pts_2d[~edge_mask] = np.nan
+    return pts_2d
+
+
+def _slice_triangle_arrays(v1, v2, v3, plane_z, eps, grid_step):
+    """Сегменты пересечения для массивов треугольников."""
+    if len(v1) == 0:
+        return []
+
+    d1 = v1[:, 2] - plane_z
+    d2 = v2[:, 2] - plane_z
+    d3 = v3[:, 2] - plane_z
+
+    p12 = _edge_plane_intersections(v1, v2, d1, d2, eps)
+    p23 = _edge_plane_intersections(v2, v3, d2, d3, eps)
+    p31 = _edge_plane_intersections(v3, v1, d3, d1, eps)
+
+    valid12 = ~np.isnan(p12[:, 0])
+    valid23 = ~np.isnan(p23[:, 0])
+    valid31 = ~np.isnan(p31[:, 0])
+    counts = valid12.astype(np.int32) + valid23.astype(np.int32) + valid31.astype(np.int32)
+    indices = np.where(counts >= 2)[0]
+
+    segments = []
+    for idx in indices:
+        pts = []
+        if valid12[idx]:
+            pts.append(p12[idx])
+        if valid23[idx]:
+            pts.append(p23[idx])
+        if valid31[idx]:
+            pts.append(p31[idx])
+
+        keys = []
+        for pt in pts:
+            key = (int(np.rint(pt[0] / grid_step)), int(np.rint(pt[1] / grid_step)))
+            if key not in keys:
+                keys.append(key)
+
+        if len(keys) < 2:
+            continue
+        if len(keys) > 2:
+            max_d = -1
+            best_pair = None
+            for i in range(len(keys)):
+                for j in range(i + 1, len(keys)):
+                    dx = keys[i][0] - keys[j][0]
+                    dy = keys[i][1] - keys[j][1]
+                    dist = dx * dx + dy * dy
+                    if dist > max_d:
+                        max_d = dist
+                        best_pair = (keys[i], keys[j])
+            if best_pair:
+                segments.append(best_pair)
+        else:
+            segments.append((keys[0], keys[1]))
+
+    return segments
+
+
+def slice_stl_plane_segments_binary(filename, z_plane=0.0, eps=1e-6, delta=0.01,
+                                    grid_step=0.2, chunk_size=500000, progress_callback=None,
+                                    max_segments=5_000_000, rotation_matrix=None,
+                                    origin=None, plane_in_aligned=False):
+    """
+    Потоковое вычисление отрезков пересечения STL с плоскостью Z=z_plane.
+    Возвращает: (segments, total_triangles, total_segments)
+    segments: список пар ((x1,y1),(x2,y2)) в виде целых ключей сетки.
+    """
+    plane_z = float(z_plane) + float(delta)
+
+    segments = []
+    total_triangles = 0
+    for chunk_start, chunk_end, total_triangles, chunk_data in _iter_stl_binary_chunks(
+        filename, chunk_size=chunk_size
+    ):
+        v1 = chunk_data['v1'].astype(np.float64)
+        v2 = chunk_data['v2'].astype(np.float64)
+        v3 = chunk_data['v3'].astype(np.float64)
+
+        if plane_in_aligned and rotation_matrix is not None and origin is not None:
+            v1 = (v1 - origin) @ rotation_matrix
+            v2 = (v2 - origin) @ rotation_matrix
+            v3 = (v3 - origin) @ rotation_matrix
+
+        z1 = v1[:, 2]
+        z2 = v2[:, 2]
+        z3 = v3[:, 2]
+
+        z_min = np.minimum(np.minimum(z1, z2), z3)
+        z_max = np.maximum(np.maximum(z1, z2), z3)
+        mask = (z_max >= plane_z - eps) & (z_min <= plane_z + eps)
+        if mask.any():
+            chunk_segments = _slice_triangle_arrays(
+                v1[mask], v2[mask], v3[mask], plane_z, eps, grid_step
+            )
+            segments.extend(chunk_segments)
+            if len(segments) > max_segments:
+                raise MemoryError(
+                    f"Too many segments ({len(segments)}). Increase grid_step or use coarser slice."
+                )
+
+        if progress_callback:
+            progress = (chunk_end / total_triangles) * 100
+            progress_callback(progress, f"Slicing: {chunk_end:,}/{total_triangles:,}")
+
+    return segments, total_triangles, len(segments)
+
+
+def calculate_perimeter_aligned(filename, *, voxel_mm=0.5, grid_step=0.2,
+                                delta=0.01, eps=1e-6, chunk_size=500000,
+                                progress_callback=None):
+    """Периметр отпечатка после выравнивания по OBB (плоскость низа)."""
+    aligned = calculate_parallelepiped_volume_streaming(
+        filename,
+        voxel_mm=voxel_mm,
+        chunk_size=chunk_size,
+        pass_c=True,
+    )
+    if not aligned:
+        return None
+
+    rotation_matrix = np.asarray(aligned['rotation_matrix'], dtype=np.float64)
+    origin = np.asarray(aligned['origin'], dtype=np.float64)
+    min_z = float(aligned['min_coords'][2])
+
+    segments, total_triangles, total_segments = slice_stl_plane_segments_binary(
+        filename,
+        z_plane=min_z,
+        eps=eps,
+        delta=delta,
+        grid_step=grid_step,
+        chunk_size=chunk_size,
+        progress_callback=progress_callback,
+        rotation_matrix=rotation_matrix,
+        origin=origin,
+        plane_in_aligned=True,
+    )
+
+    loops = _build_contours_from_segments(segments, grid_step=grid_step)
+    perimeter = perimeter_from_loops(loops)
+    return {
+        'total_triangles': total_triangles,
+        'segments_count': total_segments,
+        'loops_count': len(loops),
+        'perimeter': perimeter,
+        'loops': loops,
+        'grid_step': grid_step,
+        'z_plane': min_z,
+        'delta': delta,
+        'rotation_matrix': rotation_matrix,
+        'origin': origin,
+    }
+
+
+def _build_contours_from_segments(segments, grid_step):
+    """Сборка замкнутых контуров из списка отрезков."""
+    # Построение графа смежности
+    adj = collections.defaultdict(list)
+    for (x1, y1), (x2, y2) in segments:
+        key1 = (x1, y1)
+        key2 = (x2, y2)
+        adj[key1].append(key2)
+        adj[key2].append(key1)
+
+    visited_edges = set()
+    loops = []
+
+    for start_key in list(adj.keys()):
+        for neighbor in adj[start_key]:
+            edge = (start_key, neighbor) if start_key < neighbor else (neighbor, start_key)
+            if edge in visited_edges:
+                continue
+            visited_edges.add(edge)
+            path = [start_key, neighbor]
+            prev = start_key
+            curr = neighbor
+
+            while True:
+                next_key = None
+                for nb in adj[curr]:
+                    edge_nb = (curr, nb) if curr < nb else (nb, curr)
+                    if edge_nb in visited_edges:
+                        continue
+                    next_key = nb
+                    visited_edges.add(edge_nb)
+                    break
+
+                if next_key is None:
+                    break
+
+                path.append(next_key)
+                prev, curr = curr, next_key
+
+                if curr == start_key:
+                    loops.append(path[:-1])
+                    break
+
+    loops_pts = []
+    for loop in loops:
+        coords = np.array([[p[0] * grid_step, p[1] * grid_step] for p in loop], dtype=np.float64)
+        loops_pts.append(coords)
+    return loops_pts
+
+
+def perimeter_from_loops(loops, min_perimeter=1.0):
+    """Суммарный периметр всех контуров."""
+    total = 0.0
+    for loop in loops:
+        if len(loop) < 2:
+            continue
+        perim = 0.0
+        prev = loop[-1]
+        for curr in loop:
+            dx = curr[0] - prev[0]
+            dy = curr[1] - prev[1]
+            perim += math.hypot(dx, dy)
+            prev = curr
+        if perim >= min_perimeter:
+            total += perim
+    return total
+
+
+def calculate_perimeter_z0(filename, z_plane=0.0, delta=0.01, grid_step=0.2,
+                           eps=1e-6, chunk_size=500000, progress_callback=None):
+    """Основная функция для вычисления периметра отпечатка на плоскости Z."""
+    segments, total_triangles, total_segments = slice_stl_plane_segments_binary(
+        filename, z_plane=z_plane, eps=eps, delta=delta,
+        grid_step=grid_step, chunk_size=chunk_size,
+        progress_callback=progress_callback
+    )
+    loops = _build_contours_from_segments(segments, grid_step=grid_step)
+    perimeter = perimeter_from_loops(loops)
+    return {
+        'total_triangles': total_triangles,
+        'segments_count': total_segments,
+        'loops_count': len(loops),
+        'perimeter': perimeter,
+        'loops': loops,
+        'grid_step': grid_step,
+        'z_plane': z_plane,
+        'delta': delta,
+    }
+
+
+def _run_slice_self_tests():
+    """Самопроверки периметра на синтетических моделях."""
+    def make_box(x0, y0, z0, x1, y1, z1):
+        v = np.array([
+            [x0, y0, z0],
+            [x1, y0, z0],
+            [x1, y1, z0],
+            [x0, y1, z0],
+            [x0, y0, z1],
+            [x1, y0, z1],
+            [x1, y1, z1],
+            [x0, y1, z1],
+        ], dtype=np.float64)
+        tris = []
+        # нижняя
+        tris += [[v[0], v[1], v[2]], [v[0], v[2], v[3]]]
+        # верхняя
+        tris += [[v[4], v[6], v[5]], [v[4], v[7], v[6]]]
+        # стороны
+        tris += [[v[0], v[5], v[1]], [v[0], v[4], v[5]]]
+        tris += [[v[1], v[6], v[2]], [v[1], v[5], v[6]]]
+        tris += [[v[2], v[7], v[3]], [v[2], v[6], v[7]]]
+        tris += [[v[3], v[4], v[0]], [v[3], v[7], v[4]]]
+        return np.array(tris, dtype=np.float64)
+
+    grid_step = 0.2
+    delta = 0.01
+    eps = 1e-6
+
+    # Куб 10x10x10 на плоскости
+    cube = make_box(0, 0, 0, 10, 10, 10)
+    v1, v2, v3 = cube[:, 0], cube[:, 1], cube[:, 2]
+    segments = _slice_triangle_arrays(v1, v2, v3, delta, eps, grid_step)
+    loops = _build_contours_from_segments(segments, grid_step)
+    perim = perimeter_from_loops(loops)
+    assert abs(perim - 40.0) < 2.0, f"Cube perimeter mismatch: {perim}"
+
+    # Рамка: внешний 20x20, внутренний 10x10
+    outer = make_box(-10, -10, 0, 10, 10, 5)
+    inner = make_box(-5, -5, 0, 5, 5, 5)
+    ring = np.vstack([outer, inner])
+    v1, v2, v3 = ring[:, 0], ring[:, 1], ring[:, 2]
+    segments = _slice_triangle_arrays(v1, v2, v3, delta, eps, grid_step)
+    loops = _build_contours_from_segments(segments, grid_step)
+    perim = perimeter_from_loops(loops)
+    assert abs(perim - (80.0 + 40.0)) < 4.0, f"Ring perimeter mismatch: {perim}"
+
+    # Проверка с поворотом и выравниванием
+    angle = np.deg2rad(30)
+    rot_z = np.array([
+        [np.cos(angle), -np.sin(angle), 0.0],
+        [np.sin(angle), np.cos(angle), 0.0],
+        [0.0, 0.0, 1.0]
+    ])
+    rot_x = np.array([
+        [1.0, 0.0, 0.0],
+        [0.0, np.cos(angle), -np.sin(angle)],
+        [0.0, np.sin(angle), np.cos(angle)]
+    ])
+    rot = rot_z @ rot_x
+    trans = np.array([15.0, -7.0, 3.0])
+    cube_rot = (cube.reshape(-1, 3) @ rot.T + trans).reshape(cube.shape)
+
+    # Имитируем alignment через расчет OBB
+    v1, v2, v3 = cube_rot[:, 0], cube_rot[:, 1], cube_rot[:, 2]
+    fake_vertices = np.stack([v1, v2, v3], axis=1)
+    max_area, _, tri_vertices = find_max_area_triangle_vectorized(fake_vertices)
+    edge1 = tri_vertices[1] - tri_vertices[0]
+    edge2 = tri_vertices[2] - tri_vertices[0]
+    normal = np.cross(edge1, edge2)
+    min_c, max_c, R = calculate_aligned_bounding_box_optimized(
+        fake_vertices, normal, tri_vertices[0]
+    )
+    aligned_min_z = float(min_c[2])
+
+    segments = _slice_triangle_arrays(
+        (v1 - tri_vertices[0]) @ R, (v2 - tri_vertices[0]) @ R, (v3 - tri_vertices[0]) @ R,
+        aligned_min_z + delta, eps, grid_step
+    )
+    loops = _build_contours_from_segments(segments, grid_step)
+    perim = perimeter_from_loops(loops)
+    assert abs(perim - 40.0) < 3.0, f"Aligned rotated cube mismatch: {perim}"
+
+    print("Slice self-tests passed.")
 
 
 def _is_binary_stl_fast(filename):
@@ -158,6 +503,30 @@ def _parse_stl_binary_streaming(filename, progress_callback=None, chunk_size=500
     return max_triangle_info, unique_vertices, num_triangles
 
 
+def _iter_stl_binary_chunks(filename, chunk_size=500000):
+    """Итерация по чанкам бинарного STL без лишнего хранения в памяти."""
+    with open(filename, 'rb') as f:
+        f.read(80)
+        num_triangles = struct.unpack('I', f.read(4))[0]
+
+    mmap = np.memmap(filename, dtype=np.uint8, mode='r')
+    data_offset = 84
+    dtype = np.dtype([
+        ('normal', '3f4'),
+        ('v1', '3f4'),
+        ('v2', '3f4'),
+        ('v3', '3f4'),
+        ('attr', 'u2')
+    ])
+
+    for chunk_start in range(0, num_triangles, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, num_triangles)
+        chunk_byte_start = data_offset + chunk_start * 50
+        chunk_byte_end = data_offset + chunk_end * 50
+        chunk_data = np.frombuffer(mmap[chunk_byte_start:chunk_byte_end], dtype=dtype)
+        yield chunk_start, chunk_end, num_triangles, chunk_data
+
+
 def _calculate_triangle_area_from_vertices(v1, v2, v3):
     """Вычисление площади треугольника по трем вершинам."""
     edge1 = v2 - v1
@@ -166,63 +535,171 @@ def _calculate_triangle_area_from_vertices(v1, v2, v3):
     return 0.5 * np.linalg.norm(cross)
 
 
-def calculate_parallelepiped_volume_streaming(filename, progress_callback=None):
+def calculate_parallelepiped_volume_streaming(
+    filename,
+    progress_callback=None,
+    *,
+    voxel_mm=0.5,
+    chunk_size=500000,
+    pass_c=True,
+):
     """
     Экономная версия для больших STL файлов (>1M треугольников).
-    Использует потоковый разбор с отображением в память.
+    Использует потоковый разбор с отображением в память и 2-3 прохода.
     """
     import numpy as np
     import time
-    
+
     if progress_callback:
         progress_callback(0, "Starting STL processing...")
 
     start_time = time.time()
 
-    # Использование потокового парсера
-    max_info, unique_vertices, total_triangles = _parse_stl_binary_streaming(
-        filename, progress_callback=progress_callback
-    )
+    # Pass A: поиск треугольника максимальной площади
+    max_area = 0.0
+    max_index = -1
+    max_vertices = None
+    max_normal = None
 
-    if progress_callback:
-        progress_callback(50, "Finding bounding box...")
+    total_triangles = 0
+    for chunk_start, chunk_end, total_triangles, chunk_data in _iter_stl_binary_chunks(
+        filename, chunk_size=chunk_size
+    ):
+        v1 = chunk_data['v1'].astype(np.float64)
+        v2 = chunk_data['v2'].astype(np.float64)
+        v3 = chunk_data['v3'].astype(np.float64)
 
-    # Извлечение информации о максимальном треугольнике
-    max_area = max_info['max_area']
-    max_index = max_info['max_index']
-    max_normal = max_info['max_normal']
-    max_vertices = max_info['max_vertices']
+        edge1 = v2 - v1
+        edge2 = v3 - v1
+        cross = np.cross(edge1, edge2)
+        areas = 0.5 * np.linalg.norm(cross, axis=1)
 
-    # Создание системы координат из максимального треугольника
-    v1, v2, v3 = max_vertices
-    edge1 = v2 - v1
-    edge2 = v3 - v1
-    normal_vector = np.cross(edge1, edge2)
-    origin = v1
+        chunk_max_idx = np.argmax(areas)
+        chunk_max_area = areas[chunk_max_idx]
+        if chunk_max_area > max_area:
+            max_area = float(chunk_max_area)
+            max_index = chunk_start + int(chunk_max_idx)
+            max_vertices = np.array([
+                v1[chunk_max_idx],
+                v2[chunk_max_idx],
+                v3[chunk_max_idx]
+            ], dtype=np.float64)
+            max_normal = cross[chunk_max_idx]
 
-    # Вычисление выровненного ограничивающего бокса с использованием уникальных вершин
-    if len(unique_vertices) == 0:
+        if progress_callback:
+            progress = (chunk_end / total_triangles) * 30
+            progress_callback(progress, f"Pass A: {chunk_end:,}/{total_triangles:,}")
+
+    if max_vertices is None or total_triangles == 0:
         return None
 
-    # Использование оптимизированного вычисления ограничивающего бокса
-    min_coords, max_coords, rotation_matrix = calculate_aligned_bounding_box_optimized_large(
-        unique_vertices, normal_vector, origin
-    )
+    normal_norm = np.linalg.norm(max_normal)
+    if normal_norm < 1e-12:
+        return None
+
+    z_axis = max_normal / normal_norm
+    origin = max_vertices[0]
+
+    # Базис в плоскости
+    temp = np.array([1.0, 0.0, 0.0]) if abs(z_axis[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    x_base = np.cross(z_axis, temp)
+    x_base = x_base / np.linalg.norm(x_base)
+    y_base = np.cross(z_axis, x_base)
+    y_base = y_base / np.linalg.norm(y_base)
+
+    # Pass B: диапазон по Z и voxel thinning в плоскости
+    z_min = np.inf
+    z_max = -np.inf
+    key_dtype = np.dtype([('x', 'i8'), ('y', 'i8')])
+    voxel_keys = np.empty(0, dtype=key_dtype)
+    key_limit = 5_000_000
+
+    for chunk_start, chunk_end, total_triangles, chunk_data in _iter_stl_binary_chunks(
+        filename, chunk_size=chunk_size
+    ):
+        v1 = chunk_data['v1'].astype(np.float64)
+        v2 = chunk_data['v2'].astype(np.float64)
+        v3 = chunk_data['v3'].astype(np.float64)
+        v_all = np.vstack([v1, v2, v3])
+
+        v_trans = v_all - origin
+        z_vals = v_trans @ z_axis
+        z_min = min(z_min, float(z_vals.min()))
+        z_max = max(z_max, float(z_vals.max()))
+
+        x_vals = v_trans @ x_base
+        y_vals = v_trans @ y_base
+
+        qx = np.rint(x_vals / voxel_mm).astype(np.int64)
+        qy = np.rint(y_vals / voxel_mm).astype(np.int64)
+
+        keys_chunk = np.empty(len(qx), dtype=key_dtype)
+        keys_chunk['x'] = qx
+        keys_chunk['y'] = qy
+        voxel_keys = np.concatenate([voxel_keys, keys_chunk])
+
+        if len(voxel_keys) > key_limit:
+            voxel_keys = np.unique(voxel_keys)
+
+        if progress_callback:
+            progress = 30 + (chunk_end / total_triangles) * 40
+            progress_callback(progress, f"Pass B: {chunk_end:,}/{total_triangles:,}")
+
+    if len(voxel_keys) == 0:
+        return None
+
+    voxel_keys = np.unique(voxel_keys)
+    voxel_points = np.column_stack([
+        voxel_keys['x'].astype(np.float64) * voxel_mm,
+        voxel_keys['y'].astype(np.float64) * voxel_mm
+    ])
+
+    hull_points_2d = compute_convex_hull_2d(voxel_points)
+    if len(hull_points_2d) == 0:
+        return None
+
+    # Поиск минимального прямоугольника (O(h))
+    angle, width, height, min_area = rotating_calipers_min_area_rectangle(hull_points_2d)
+
+    x_axis = np.cos(angle) * x_base + np.sin(angle) * y_base
+    y_axis = -np.sin(angle) * x_base + np.cos(angle) * y_base
+    best_rotation = np.column_stack([x_axis, y_axis, z_axis])
+
+    # Pass C: точные экстенты в финальной системе
+    min_coords = np.array([np.inf, np.inf, np.inf], dtype=np.float64)
+    max_coords = np.array([-np.inf, -np.inf, -np.inf], dtype=np.float64)
+
+    if pass_c:
+        for chunk_start, chunk_end, total_triangles, chunk_data in _iter_stl_binary_chunks(
+            filename, chunk_size=chunk_size
+        ):
+            v1 = chunk_data['v1'].astype(np.float64)
+            v2 = chunk_data['v2'].astype(np.float64)
+            v3 = chunk_data['v3'].astype(np.float64)
+            v_all = np.vstack([v1, v2, v3])
+            transformed = (v_all - origin) @ best_rotation
+            min_coords = np.minimum(min_coords, transformed.min(axis=0))
+            max_coords = np.maximum(max_coords, transformed.max(axis=0))
+
+            if progress_callback:
+                progress = 70 + (chunk_end / total_triangles) * 30
+                progress_callback(progress, f"Pass C: {chunk_end:,}/{total_triangles:,}")
+    else:
+        min_coords = np.array([-width / 2, -height / 2, z_min], dtype=np.float64)
+        max_coords = np.array([width / 2, height / 2, z_max], dtype=np.float64)
 
     dimensions = max_coords - min_coords
     volume = dimensions[0] * dimensions[1] * dimensions[2]
 
-    # Создание словаря максимального треугольника для совместимости
     max_triangle_dict = {
         'normal': max_normal.tolist(),
         'vertices': max_vertices.tolist()
     }
 
     end_time = time.time()
-
     if progress_callback:
         progress_callback(100, f"Completed in {end_time - start_time:.1f} seconds")
-    
+
     return {
         'total_triangles': total_triangles,
         'max_triangle_index': max_index,
@@ -232,8 +709,10 @@ def calculate_parallelepiped_volume_streaming(filename, progress_callback=None):
         'max_coords': max_coords,
         'dimensions': dimensions,
         'volume': volume,
-        'rotation_matrix': rotation_matrix,
+        'rotation_matrix': best_rotation,
         'origin': origin.tolist(),
+        'voxel_mm': voxel_mm,
+        'min_area_2d': min_area,
     }
 
 
@@ -248,34 +727,29 @@ def calculate_aligned_bounding_box_optimized_large(unique_vertices, normal_vecto
     # Нормализация нормали
     z_axis = normal_vector / np.linalg.norm(normal_vector)
 
-    # Проекция вершин на плоскость, перпендикулярную нормали
-    v_translated = unique_vertices - origin
+    # Проекция вершин на плоскость, перпендикулярную нормали (в базисе плоскости)
+    v_translated = (unique_vertices - origin).astype(np.float64)
     projection_lengths = np.dot(v_translated, z_axis)
-
-    # Использование трансляции для эффективности
     projection_lengths_3d = projection_lengths[:, np.newaxis]
-    projected_2d = v_translated - projection_lengths_3d * z_axis
+    projected_3d = v_translated - projection_lengths_3d * z_axis
 
-    # Для очень больших наборов, выборка для выпуклой оболочки
-    if len(projected_2d) > 10000:
-        # Использование случайной выборки для приближения выпуклой оболочки
-        sample_indices = np.random.choice(len(projected_2d), size=10000, replace=False)
-        hull_points_2d = compute_convex_hull_2d(projected_2d[sample_indices, :2])
-    else:
-        hull_points_2d = compute_convex_hull_2d(projected_2d[:, :2])
-
-    if len(hull_points_2d) == 0:
-        return np.zeros(3), np.zeros(3), np.eye(3)
-
-    # Поиск минимального прямоугольника с использованием вращающихся штангенциркулей
-    min_area, angle, width, height = rotating_calipers_min_area_rectangle(hull_points_2d)
-
-    # Создание матрицы вращения для оптимальной ориентации
     temp = np.array([1.0, 0.0, 0.0]) if abs(z_axis[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
     x_base = np.cross(z_axis, temp)
     x_base = x_base / np.linalg.norm(x_base)
     y_base = np.cross(z_axis, x_base)
     y_base = y_base / np.linalg.norm(y_base)
+
+    x_coords = np.dot(projected_3d, x_base)
+    y_coords = np.dot(projected_3d, y_base)
+    projected_2d = np.column_stack([x_coords, y_coords])
+
+    hull_points_2d = compute_convex_hull_2d(projected_2d)
+
+    if len(hull_points_2d) == 0:
+        return np.zeros(3), np.zeros(3), np.eye(3)
+
+    # Поиск минимального прямоугольника с использованием вращающихся штангенциркулей
+    angle, width, height, min_area = rotating_calipers_min_area_rectangle(hull_points_2d)
 
     # Оптимальное вращение в плоскости
     x_axis = np.cos(angle) * x_base + np.sin(angle) * y_base
@@ -514,58 +988,181 @@ def compute_convex_hull_2d(points):
         return points
 
 
+def _remove_collinear_ccw(points, tol=1e-12):
+    """Удаление коллинеарных соседних вершин из CCW выпуклого многоугольника."""
+    n = len(points)
+    if n < 3:
+        return points
+
+    cleaned = []
+    for i in range(n):
+        p_prev = points[i - 1]
+        p_curr = points[i]
+        p_next = points[(i + 1) % n]
+        v1 = p_curr - p_prev
+        v2 = p_next - p_curr
+        cross = v1[0] * v2[1] - v1[1] * v2[0]
+        if abs(cross) > tol:
+            cleaned.append(p_curr)
+
+    return np.array(cleaned, dtype=np.float64)
+
+
 def rotating_calipers_min_area_rectangle(points):
     """
-    Поиск прямоугольника минимальной площади с использованием алгоритма вращающихся штангенциркулей.
-    points: (n, 2) массив точек выпуклой оболочки в порядке против часовой стрелки
-    Возвращает: (min_area, rotation_angle, width, height)
+    Минимальный прямоугольник для CCW выпуклого многоугольника за O(h).
+    Возвращает: (angle, width, height, min_area)
     """
-    n = len(points)
+    pts = np.asarray(points, dtype=np.float64)
+    if len(pts) < 2:
+        return 0.0, 0.0, 0.0, 0.0
+
+    pts = _remove_collinear_ccw(pts)
+    n = len(pts)
     if n < 2:
         return 0.0, 0.0, 0.0, 0.0
 
-    # Инициализация штангенциркулей
+    edges = np.roll(pts, -1, axis=0) - pts
+
+    def _advance_max(idx, direction):
+        best = idx
+        best_proj = float(np.dot(pts[best], direction))
+        while True:
+            nxt = (best + 1) % n
+            nxt_proj = float(np.dot(pts[nxt], direction))
+            if nxt_proj > best_proj + 1e-12:
+                best = nxt
+                best_proj = nxt_proj
+            else:
+                break
+        return best, best_proj
+
+    def _advance_min(idx, direction):
+        best = idx
+        best_proj = float(np.dot(pts[best], direction))
+        while True:
+            nxt = (best + 1) % n
+            nxt_proj = float(np.dot(pts[nxt], direction))
+            if nxt_proj < best_proj - 1e-12:
+                best = nxt
+                best_proj = nxt_proj
+            else:
+                break
+        return best, best_proj
+
+    # Инициализация экстремумов
+    u0 = edges[0]
+    u0 = u0 / np.linalg.norm(u0)
+    v0 = np.array([-u0[1], u0[0]])
+
+    proj_u = pts @ u0
+    proj_v = pts @ v0
+    i_max_u = int(np.argmax(proj_u))
+    i_min_u = int(np.argmin(proj_u))
+    i_max_v = int(np.argmax(proj_v))
+    i_min_v = int(np.argmin(proj_v))
+
     min_area = float('inf')
     best_angle = 0.0
     best_width = 0.0
     best_height = 0.0
 
-    # Для каждого ребра как базового направления
     for i in range(n):
-        # Текущее направление ребра
-        p1 = points[i]
-        p2 = points[(i + 1) % n]
-        edge_dir = p2 - p1
-        edge_len = np.linalg.norm(edge_dir)
-
-        if edge_len < 1e-10:
+        edge = edges[i]
+        edge_len = np.linalg.norm(edge)
+        if edge_len < 1e-12:
             continue
-
-        # Единичный вектор направления
-        u = edge_dir / edge_len
-
-        # Перпендикулярный вектор
+        u = edge / edge_len
         v = np.array([-u[1], u[0]])
 
-        # Проекция всех точек на оси u и v
-        proj_u = np.dot(points, u)
-        proj_v = np.dot(points, v)
+        i_max_u, max_u = _advance_max(i_max_u, u)
+        i_min_u, min_u = _advance_min(i_min_u, u)
+        i_max_v, max_v = _advance_max(i_max_v, v)
+        i_min_v, min_v = _advance_min(i_min_v, v)
 
-        # Вычисление экстентов
-        u_min, u_max = proj_u.min(), proj_u.max()
-        v_min, v_max = proj_v.min(), proj_v.max()
-
-        width = u_max - u_min
-        height = v_max - v_min
+        width = max_u - min_u
+        height = max_v - min_v
         area = width * height
 
         if area < min_area:
             min_area = area
-            best_angle = np.arctan2(u[1], u[0])
+            best_angle = float(np.arctan2(u[1], u[0]))
+            best_width = float(width)
+            best_height = float(height)
+
+    return best_angle, best_width, best_height, min_area
+
+
+def _bruteforce_min_area_rectangle(points, step_deg=1.0):
+    """Грубая проверка через перебор углов."""
+    pts = np.asarray(points, dtype=np.float64)
+    if len(pts) == 0:
+        return 0.0, 0.0, 0.0, 0.0
+    min_area = float('inf')
+    best_angle = 0.0
+    best_width = 0.0
+    best_height = 0.0
+    for angle_deg in np.arange(0.0, 180.0, step_deg):
+        angle = np.deg2rad(angle_deg)
+        u = np.array([np.cos(angle), np.sin(angle)])
+        v = np.array([-u[1], u[0]])
+        proj_u = pts @ u
+        proj_v = pts @ v
+        width = proj_u.max() - proj_u.min()
+        height = proj_v.max() - proj_v.min()
+        area = width * height
+        if area < min_area:
+            min_area = area
+            best_angle = angle
             best_width = width
             best_height = height
+    return best_angle, best_width, best_height, min_area
 
-    return min_area, best_angle, best_width, best_height
+
+def _run_self_checks():
+    """Минимальные самопроверки вращающихся калиперов без внешних файлов."""
+    np.random.seed(0)
+    voxel_mm = 0.5
+
+    def make_rotated_rectangle(width, height, angle_deg):
+        hw, hh = width / 2, height / 2
+        rect = np.array([
+            [-hw, -hh],
+            [hw, -hh],
+            [hw, hh],
+            [-hw, hh]
+        ], dtype=np.float64)
+        angle = np.deg2rad(angle_deg)
+        rot = np.array([
+            [np.cos(angle), -np.sin(angle)],
+            [np.sin(angle), np.cos(angle)]
+        ])
+        return rect @ rot.T
+
+    cases = [
+        (1000.0, 1500.0, 45.0),
+        (800.0, 500.0, 33.0),
+        (1200.0, 200.0, 12.0)
+    ]
+
+    for width, height, angle in cases:
+        corners = make_rotated_rectangle(width, height, angle)
+        jitter = np.random.uniform(-0.2, 0.2, size=(200, 2))
+        samples = np.vstack([corners, corners + jitter])
+
+        qx = np.rint(samples[:, 0] / voxel_mm).astype(np.int64)
+        qy = np.rint(samples[:, 1] / voxel_mm).astype(np.int64)
+        pts = np.column_stack([qx * voxel_mm, qy * voxel_mm])
+
+        hull_pts = compute_convex_hull_2d(pts)
+        rc_angle, rc_w, rc_h, rc_area = rotating_calipers_min_area_rectangle(hull_pts)
+        bf_angle, bf_w, bf_h, bf_area = _bruteforce_min_area_rectangle(hull_pts, step_deg=1.0)
+
+        assert rc_area <= bf_area + 1e-6, "Rotating calipers хуже brute-force"
+        assert abs(rc_w - width) <= 1.0 or abs(rc_h - width) <= 1.0, "Ширина >1мм"
+        assert abs(rc_h - height) <= 1.0 or abs(rc_w - height) <= 1.0, "Высота >1мм"
+
+    print("Self-checks passed.")
 
 
 def calculate_aligned_bounding_box_optimized(vertices, normal_vector, origin):
@@ -583,12 +1180,11 @@ def calculate_aligned_bounding_box_optimized(vertices, normal_vector, origin):
     # Преобразование в (n*3, 3) и использование unique
     all_vertices = vertices.reshape(-1, 3)
 
-    # Использование округления для уменьшения дубликатов
-    rounded_vertices = np.round(all_vertices, decimals=6)
-    unique_vertices = np.unique(rounded_vertices, axis=0)
+    # Уникальные вершины без округления координат
+    unique_vertices = np.unique(all_vertices, axis=0)
 
     # Проекция вершин на плоскость, перпендикулярную нормали
-    v_translated = unique_vertices - origin
+    v_translated = (unique_vertices - origin).astype(np.float64)
     projection_lengths = np.dot(v_translated, z_axis)
 
     projection_lengths_3d = projection_lengths[:, np.newaxis]
@@ -617,7 +1213,7 @@ def calculate_aligned_bounding_box_optimized(vertices, normal_vector, origin):
         return np.zeros(3), np.zeros(3), np.eye(3)
 
     # Поиск минимального прямоугольника с использованием алг. вращающихся калиперов
-    min_area, angle, width, height = rotating_calipers_min_area_rectangle(hull_points_2d)
+    angle, width, height, min_area = rotating_calipers_min_area_rectangle(hull_points_2d)
 
     # Создание матрицы вращения для оптимальной ориентации в плоскости
     x_axis = np.cos(angle) * x_base + np.sin(angle) * y_base
@@ -743,8 +1339,7 @@ def calculate_aligned_bounding_box(triangles, normal_vector, origin):
     unique_vertices = set()
     for triangle in triangles:
         for vertex in triangle["vertices"]:
-            vertex_tuple = tuple(np.round(vertex, decimals=10))
-            unique_vertices.add(vertex_tuple)
+            unique_vertices.add(tuple(vertex))
 
     all_vertices = [np.array(v) for v in unique_vertices]
 
@@ -810,8 +1405,7 @@ def calculate_nonrotated_bounding_box(triangles):
     unique_vertices = set()
     for triangle in triangles:
         for vertex in triangle["vertices"]:
-            vertex_tuple = tuple(np.round(vertex, decimals=10))
-            unique_vertices.add(vertex_tuple)
+            unique_vertices.add(tuple(vertex))
 
     all_vertices = np.array([list(v) for v in unique_vertices])
 
@@ -909,17 +1503,67 @@ def main():
         print("Опции:")
         print("  --volume          Рассчитать объём ориентированного параллелепипеда")
         print("  --nonrot-volume   Рассчитать объём осеориентированного бокса")
+        print("  --perimeter-z0    Рассчитать периметр отпечатка на плоскости Z=0")
+        print("  --voxel-mm <mm>   Шаг квантования для voxel thinning (по умолчанию 0.5)")
+        print("  --grid-step <mm>  Шаг квантования для периметра (по умолчанию 0.2)")
+        print("  --delta <mm>      Сдвиг плоскости для реза (по умолчанию 0.01)")
+        print("  --eps <mm>        Допуск при резе (по умолчанию 1e-6)")
+        print("  --z-plane <mm>    Плоскость для периметра (по умолчанию 0.0)")
+        print("  --chunk-size <n>  Размер чанка треугольников для стриминга")
+        print("  --self-test       Запуск самопроверок")
+        print("  --slice-test      Запуск самопроверок периметра")
         print("\nПримеры:")
         print("  python stl.py model.stl")
         print("  python stl.py model.stl --volume")
         print("  python stl.py model.stl --nonrot-volume")
+        print("  python stl.py model.stl --perimeter-z0 --grid-step 0.2")
         return
 
     filename = sys.argv[1]
     calculate_volume = "--volume" in sys.argv
     calculate_nonrot_volume = "--nonrot-volume" in sys.argv
+    calculate_perimeter = "--perimeter-z0" in sys.argv
+    run_self_test = "--self-test" in sys.argv
+    run_slice_test = "--slice-test" in sys.argv
+
+    voxel_mm = 0.5
+    grid_step = 0.2
+    delta = 0.01
+    eps = 1e-6
+    z_plane = 0.0
+    chunk_size = 500000
+    if "--voxel-mm" in sys.argv:
+        idx = sys.argv.index("--voxel-mm")
+        if idx + 1 < len(sys.argv):
+            voxel_mm = float(sys.argv[idx + 1])
+    if "--grid-step" in sys.argv:
+        idx = sys.argv.index("--grid-step")
+        if idx + 1 < len(sys.argv):
+            grid_step = float(sys.argv[idx + 1])
+    if "--delta" in sys.argv:
+        idx = sys.argv.index("--delta")
+        if idx + 1 < len(sys.argv):
+            delta = float(sys.argv[idx + 1])
+    if "--eps" in sys.argv:
+        idx = sys.argv.index("--eps")
+        if idx + 1 < len(sys.argv):
+            eps = float(sys.argv[idx + 1])
+    if "--z-plane" in sys.argv:
+        idx = sys.argv.index("--z-plane")
+        if idx + 1 < len(sys.argv):
+            z_plane = float(sys.argv[idx + 1])
+    if "--chunk-size" in sys.argv:
+        idx = sys.argv.index("--chunk-size")
+        if idx + 1 < len(sys.argv):
+            chunk_size = int(sys.argv[idx + 1])
 
     try:
+        if run_self_test:
+            _run_self_checks()
+            return
+        if run_slice_test:
+            _run_slice_self_tests()
+            return
         if calculate_nonrot_volume:
             result = calculate_nonrotated_volume(filename)
 
@@ -943,7 +1587,11 @@ def main():
                 print(f"\n  ОБЪЁМ: {result['volume']:.6f}")
                 print("=" * 60)
         elif calculate_volume:
-            result = calculate_parallelepiped_volume(filename)
+            result = calculate_parallelepiped_volume_streaming(
+                filename,
+                voxel_mm=voxel_mm,
+                chunk_size=chunk_size
+            )
 
             if result:
                 print("\n" + "=" * 60)
@@ -966,6 +1614,25 @@ def main():
                     f"[{result['max_coords'][0]:.6f}, {result['max_coords'][1]:.6f}, {result['max_coords'][2]:.6f}]"
                 )
                 print(f"\n  ОБЪЁМ: {result['volume']:.6f}")
+                print("=" * 60)
+        elif calculate_perimeter:
+            result = calculate_perimeter_aligned(
+                filename,
+                voxel_mm=voxel_mm,
+                grid_step=grid_step,
+                delta=delta,
+                eps=eps,
+                chunk_size=chunk_size
+            )
+
+            if result:
+                print("\n" + "=" * 60)
+                print("Периметр отпечатка на плоскости")
+                print("=" * 60)
+                print(f"Плоскость Z: {result['z_plane']:.3f} (delta={result['delta']:.3f})")
+                print(f"Сегментов: {result['segments_count']}")
+                print(f"Контуров: {result['loops_count']}")
+                print(f"\n  ПЕРИМЕТР: {result['perimeter']:.6f}")
                 print("=" * 60)
         else:
             result = find_max_area_triangle(filename)

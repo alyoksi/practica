@@ -188,6 +188,7 @@ class BoundingBoxApp(QMainWindow):
         self.y_value = "—"
         self.z_value = "—"
         self.volume_value = "—"
+        self.perimeter_value = "—"
         self.unit_var = "мм"
 
         # Сырые значения в миллиметрах (как из функций)
@@ -195,12 +196,14 @@ class BoundingBoxApp(QMainWindow):
         self.raw_y = None
         self.raw_z = None
         self.raw_volume = None
+        self.raw_perimeter = None
 
         # Базовые (исходные) размеры для пропорций
         self.base_raw_x = None
         self.base_raw_y = None
         self.base_raw_z = None
         self.base_raw_volume = None
+        self.base_raw_perimeter = None
 
         self.stl_module = stlmod
         self.clipboard = QApplication.clipboard()
@@ -276,6 +279,7 @@ class BoundingBoxApp(QMainWindow):
 
         extras_layout = QHBoxLayout()
         self._create_extra_block(extras_layout, "Объём", "мм³", "volume")
+        self._create_extra_block(extras_layout, "Периметр", "мм", "perimeter")
         layout.addLayout(extras_layout)
 
         unit_layout = QHBoxLayout()
@@ -411,9 +415,18 @@ class BoundingBoxApp(QMainWindow):
             import time
             transform_start_time = time.time()
             result = self.stl_module.calculate_parallelepiped_volume(file_path)
+            perimeter_result = self.stl_module.calculate_perimeter_aligned(
+                file_path,
+                voxel_mm=0.5,
+                grid_step=0.2,
+                delta=0.01,
+                eps=1e-6,
+                chunk_size=500000
+            )
             transform_end_time = time.time()
             print("---Преобразование: %s секунд ---" % (transform_end_time - transform_start_time))
             volume = result["volume"] if result else None
+            perimeter = perimeter_result["perimeter"] if perimeter_result else None
         except Exception as exc:
             self.status_text = f"Ошибка чтения файла: {exc}"
             self.status_label.setText(self.status_text)
@@ -432,10 +445,12 @@ class BoundingBoxApp(QMainWindow):
         dims = result['dimensions']
         self.raw_x, self.raw_y, self.raw_z = dims
         self.raw_volume = volume
+        self.raw_perimeter = perimeter
 
         # Сохраняем базовые размеры для пропорций
         self.base_raw_x, self.base_raw_y, self.base_raw_z = dims
         self.base_raw_volume = volume
+        self.base_raw_perimeter = perimeter
 
         # Включаем поля для редактирования
         self.x_edit.setReadOnly(False)
@@ -446,6 +461,7 @@ class BoundingBoxApp(QMainWindow):
         self.z_edit.setEnabled(True)
         
         # Включаем кнопку восстановления
+        
         self.restore_button.setEnabled(True)
 
         # Включаем кнопку копирования
@@ -464,6 +480,7 @@ class BoundingBoxApp(QMainWindow):
         self.y_unit_label.setText(unit)
         self.z_unit_label.setText(unit)
         self.volume_unit_label.setText(f"{unit}³")
+        self.perimeter_unit_label.setText(unit)
 
         # Линейные размеры
         self._updating_display = True
@@ -495,11 +512,18 @@ class BoundingBoxApp(QMainWindow):
         else:
             self.volume_label.setText("—")
 
+        if self.raw_perimeter is not None:
+            conv_perimeter = _convert_value(self.raw_perimeter, "мм", unit)
+            self.perimeter_label.setText(_format_dimension(conv_perimeter, unit))
+        else:
+            self.perimeter_label.setText("—")
+
     def _clear_raw(self):
         self.raw_x = None
         self.raw_y = None
         self.raw_z = None
         self.raw_volume = None
+        self.raw_perimeter = None
 
         # Отключаем поля для редактирования
         if hasattr(self, 'x_edit'):
