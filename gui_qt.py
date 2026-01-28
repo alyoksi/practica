@@ -10,6 +10,7 @@ from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
@@ -63,6 +64,93 @@ def _convert_value(value, from_unit, to_unit, is_square=False, is_cubic=False):
     if is_cubic:
         factor = factor ** 3
     return value * factor
+
+
+class LoginDialog(QDialog):
+    """Диалоговое окно для входа в систему"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Вход в систему")
+        self.setGeometry(200, 200, 400, 200)
+        
+        self.user_type = None  # "general" или "admin"
+        self.setModal(True)  # Модальное окно
+        
+        self._setup_ui()
+        
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        
+        # Заголовок
+        title_label = QLabel("Выберите тип пользователя")
+        title_label.setStyleSheet("font-size: 16px; font-weight: bold; margin-bottom: 20px;")
+        title_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title_label)
+        
+        # Кнопка для общего пользователя
+        self.general_user_button = QPushButton("Общий пользователь")
+        self.general_user_button.setStyleSheet("font-size: 14px; padding: 10px;")
+        self.general_user_button.clicked.connect(self._login_as_general)
+        layout.addWidget(self.general_user_button)
+        
+        # Разделитель
+        separator = QLabel("или")
+        separator.setAlignment(Qt.AlignCenter)
+        separator.setStyleSheet("margin: 10px; color: gray;")
+        layout.addWidget(separator)
+        
+        # Администратор
+        admin_label = QLabel("Администратор")
+        admin_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(admin_label)
+        
+        # Поле для пароля администратора
+        password_layout = QHBoxLayout()
+        password_label = QLabel("Пароль:")
+        password_layout.addWidget(password_label)
+        
+        self.password_edit = QLineEdit()
+        self.password_edit.setEchoMode(QLineEdit.Password)
+        self.password_edit.setPlaceholderText("Введите пароль")
+        password_layout.addWidget(self.password_edit)
+        layout.addLayout(password_layout)
+        
+        # Кнопка входа как администратор
+        self.admin_login_button = QPushButton("Войти как администратор")
+        self.admin_login_button.setStyleSheet("font-size: 14px; padding: 10px;")
+        self.admin_login_button.clicked.connect(self._login_as_admin)
+        layout.addWidget(self.admin_login_button)
+        
+        # Метка для сообщений об ошибках
+        self.error_label = QLabel("")
+        self.error_label.setStyleSheet("color: red;")
+        self.error_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.error_label)
+        
+        # Кнопка отмены
+        cancel_button = QPushButton("Отмена")
+        cancel_button.clicked.connect(self.reject)
+        layout.addWidget(cancel_button)
+        
+    def _login_as_general(self):
+        """Вход как общий пользователь"""
+        self.user_type = "general"
+        self.accept()
+        
+    def _login_as_admin(self):
+        """Вход как администратор"""
+        password = self.password_edit.text().strip()
+        
+        if password == "admin":
+            self.user_type = "admin"
+            self.accept()
+        else:
+            self.error_label.setText("Неверный пароль")
+            self.password_edit.clear()
+            
+    def get_user_type(self):
+        """Возвращает тип пользователя после успешного входа"""
+        return self.user_type
 
 
 class DropArea(QFrame):
@@ -546,6 +634,22 @@ class BoundingBoxApp(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    
+    # Сначала показываем диалог входа
+    login_dialog = LoginDialog()
+    result = login_dialog.exec()
+    
+    # Если пользователь нажал Cancel или закрыл окно
+    if result != QDialog.Accepted:
+        sys.exit(0)
+        
+    # Получаем тип пользователя
+    user_type = login_dialog.get_user_type()
+    
+    if user_type is None:
+        sys.exit(0)
+    
+    # Создаем и показываем главное окно
     window = BoundingBoxApp()
     window.show()
     sys.exit(app.exec())
