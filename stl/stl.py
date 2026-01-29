@@ -92,13 +92,10 @@ def slice_stl_plane_segments_binary(filename, z_plane=0.0, eps=1e-6, delta=0.01,
 
     segments = []
     total_triangles = 0
-    for chunk_start, chunk_end, total_triangles, chunk_data in _iter_stl_binary_chunks(
+
+    for chunk_start, chunk_end, total_triangles, v1, v2, v3 in _iter_stl_chunks_auto(
         filename, chunk_size=chunk_size
     ):
-        v1 = chunk_data['v1'].astype(np.float64)
-        v2 = chunk_data['v2'].astype(np.float64)
-        v3 = chunk_data['v3'].astype(np.float64)
-
         if plane_in_aligned and rotation_matrix is not None and origin is not None:
             v1 = (v1 - origin) @ rotation_matrix
             v2 = (v2 - origin) @ rotation_matrix
@@ -523,8 +520,44 @@ def _iter_stl_binary_chunks(filename, chunk_size=500000):
         chunk_end = min(chunk_start + chunk_size, num_triangles)
         chunk_byte_start = data_offset + chunk_start * 50
         chunk_byte_end = data_offset + chunk_end * 50
-        chunk_data = np.frombuffer(mmap[chunk_byte_start:chunk_byte_end], dtype=dtype)
+        chunk_data_slice = mmap[chunk_byte_start:chunk_byte_end]
+        if len(chunk_data_slice) % dtype.itemsize != 0:
+            raise ValueError(
+                "Buffer size must be a multiple of element size. "
+                "This indicates the file is likely an ASCII STL format or corrupted binary STL file. "
+                "Please convert to binary STL or verify file integrity."
+            )
+        chunk_data = np.frombuffer(chunk_data_slice, dtype=dtype)
         yield chunk_start, chunk_end, num_triangles, chunk_data
+
+
+def _iter_stl_ascii_chunks(filename, chunk_size=500000):
+    """Итерация по чанкам ASCII STL, загружая весь файл и разбивая на чанки."""
+    vertices, _ = _parse_stl_ascii_vectorized(filename)
+    total_triangles = vertices.shape[0]
+
+    if total_triangles == 0:
+        return
+
+    for chunk_start in range(0, total_triangles, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, total_triangles)
+        v1 = vertices[chunk_start:chunk_end, 0].astype(np.float64)
+        v2 = vertices[chunk_start:chunk_end, 1].astype(np.float64)
+        v3 = vertices[chunk_start:chunk_end, 2].astype(np.float64)
+        yield chunk_start, chunk_end, total_triangles, v1, v2, v3
+
+
+def _iter_stl_chunks_auto(filename, chunk_size=500000):
+    """Универсальный итератор по чанкам STL для бинарного и ASCII форматов."""
+    if _is_binary_stl_fast(filename):
+        for chunk_start, chunk_end, total_triangles, chunk_data in _iter_stl_binary_chunks(filename, chunk_size):
+            v1 = chunk_data['v1'].astype(np.float64)
+            v2 = chunk_data['v2'].astype(np.float64)
+            v3 = chunk_data['v3'].astype(np.float64)
+            yield chunk_start, chunk_end, total_triangles, v1, v2, v3
+    else:
+        for chunk_start, chunk_end, total_triangles, v1, v2, v3 in _iter_stl_ascii_chunks(filename, chunk_size):
+            yield chunk_start, chunk_end, total_triangles, v1, v2, v3
 
 
 def _calculate_triangle_area_from_vertices(v1, v2, v3):
@@ -562,13 +595,9 @@ def calculate_parallelepiped_volume_streaming(
     max_normal = None
 
     total_triangles = 0
-    for chunk_start, chunk_end, total_triangles, chunk_data in _iter_stl_binary_chunks(
+    for chunk_start, chunk_end, total_triangles, v1, v2, v3 in _iter_stl_chunks_auto(
         filename, chunk_size=chunk_size
     ):
-        v1 = chunk_data['v1'].astype(np.float64)
-        v2 = chunk_data['v2'].astype(np.float64)
-        v3 = chunk_data['v3'].astype(np.float64)
-
         edge1 = v2 - v1
         edge2 = v3 - v1
         cross = np.cross(edge1, edge2)
@@ -614,12 +643,9 @@ def calculate_parallelepiped_volume_streaming(
     voxel_keys = np.empty(0, dtype=key_dtype)
     key_limit = 5_000_000
 
-    for chunk_start, chunk_end, total_triangles, chunk_data in _iter_stl_binary_chunks(
+    for chunk_start, chunk_end, total_triangles, v1, v2, v3 in _iter_stl_chunks_auto(
         filename, chunk_size=chunk_size
     ):
-        v1 = chunk_data['v1'].astype(np.float64)
-        v2 = chunk_data['v2'].astype(np.float64)
-        v3 = chunk_data['v3'].astype(np.float64)
         v_all = np.vstack([v1, v2, v3])
 
         v_trans = v_all - origin
@@ -670,12 +696,9 @@ def calculate_parallelepiped_volume_streaming(
     max_coords = np.array([-np.inf, -np.inf, -np.inf], dtype=np.float64)
 
     if pass_c:
-        for chunk_start, chunk_end, total_triangles, chunk_data in _iter_stl_binary_chunks(
+        for chunk_start, chunk_end, total_triangles, v1, v2, v3 in _iter_stl_chunks_auto(
             filename, chunk_size=chunk_size
         ):
-            v1 = chunk_data['v1'].astype(np.float64)
-            v2 = chunk_data['v2'].astype(np.float64)
-            v3 = chunk_data['v3'].astype(np.float64)
             v_all = np.vstack([v1, v2, v3])
             transformed = (v_all - origin) @ best_rotation
             min_coords = np.minimum(min_coords, transformed.min(axis=0))
@@ -877,7 +900,6 @@ def parse_stl_vectorized(filename):
     start_time = time.time()
 
     file_output = _parse_stl_binary_vectorized(filename) if _is_binary_stl_fast(filename) else _parse_stl_ascii_vectorized(filename)
-
     print("---Парсинг: %s секунд ---" % (time.time() - start_time))
     return file_output
 
@@ -1230,7 +1252,7 @@ def calculate_aligned_bounding_box_optimized(vertices, normal_vector, origin):
 
     # Сортировка размеров по размеру (наибольший первым) для обеспечения согласованного порядка
     sorted_indices = np.argsort(-np.abs(dimensions))  # Отрицательное для убывания
-    dimensions_sorted = dimensions[sorted_indices]
+    # dimensions_sorted = dimensions[sorted_indices]
     min_coords_sorted = min_coords[sorted_indices]
     max_coords_sorted = max_coords[sorted_indices]
 
