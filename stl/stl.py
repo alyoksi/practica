@@ -261,6 +261,159 @@ def calculate_perimeter_z0(filename, z_plane=0.0, delta=0.01, grid_step=0.2,
     }
 
 
+def _count_boundary_segments(geometry):
+    if geometry.is_empty:
+        return 0
+    boundary = geometry.boundary
+    if boundary.geom_type == "LineString":
+        return max(0, len(boundary.coords) - 1)
+    if boundary.geom_type == "MultiLineString":
+        return sum(max(0, len(line.coords) - 1) for line in boundary.geoms)
+    return 0
+
+
+def calculate_contact_perimeter_projected(
+    filename,
+    *,
+    snap_xy=0.001,
+    chunk_size=500000,
+    union_batch_size=20000,
+    fast_union_threshold=50000,
+    progress_callback=None,
+):
+    """
+    Периметр контакта как длина границы объединения проекций треугольников
+    на плоскость максимального треугольника.
+    Возвращает dict: perimeter, boundary_edges, snap_xy, total_triangles, projected_triangles.
+    """
+    from shapely import polygons as shapely_polygons
+    from shapely import set_precision
+    from shapely import union_all as shapely_union_all
+    from shapely.ops import unary_union
+
+    max_area = 0.0
+    max_vertices = None
+    total_triangles = 0
+
+    for chunk_start, chunk_end, total_triangles, v1, v2, v3 in _iter_stl_chunks_auto(
+        filename, chunk_size=chunk_size
+    ):
+        edge1 = v2 - v1
+        edge2 = v3 - v1
+        cross = np.cross(edge1, edge2)
+        areas = 0.5 * np.linalg.norm(cross, axis=1)
+        chunk_max_idx = np.argmax(areas)
+        chunk_max_area = float(areas[chunk_max_idx])
+        if chunk_max_area > max_area:
+            max_area = chunk_max_area
+            max_vertices = np.array([
+                v1[chunk_max_idx],
+                v2[chunk_max_idx],
+                v3[chunk_max_idx],
+            ], dtype=np.float64)
+
+        if progress_callback:
+            progress = (chunk_end / total_triangles) * 10
+            progress_callback(progress, f"Max triangle: {chunk_end:,}/{total_triangles:,}")
+
+    if max_vertices is None:
+        return None
+
+    rotation_matrix, origin = create_coordinate_system_from_triangle_vectorized(max_vertices)
+
+    current_union = None
+    projected_triangles = 0
+    polygons_buffer = []
+    buffered_count = 0
+
+    def _build_polygons(v1_xy, v2_xy, v3_xy):
+        if snap_xy and snap_xy > 0:
+            v1_xy = np.round(v1_xy / snap_xy) * snap_xy
+            v2_xy = np.round(v2_xy / snap_xy) * snap_xy
+            v3_xy = np.round(v3_xy / snap_xy) * snap_xy
+
+        area2 = np.abs(
+            (v2_xy[:, 0] - v1_xy[:, 0]) * (v3_xy[:, 1] - v1_xy[:, 1])
+            - (v2_xy[:, 1] - v1_xy[:, 1]) * (v3_xy[:, 0] - v1_xy[:, 0])
+        )
+        valid = area2 > 1e-12
+        if not np.any(valid):
+            return None, 0
+
+        coords = np.stack([v1_xy[valid], v2_xy[valid], v3_xy[valid]], axis=1)
+        polygons = shapely_polygons(coords)
+        return polygons, int(np.sum(valid))
+
+    for chunk_start, chunk_end, total_triangles, v1, v2, v3 in _iter_stl_chunks_auto(
+        filename, chunk_size=chunk_size
+    ):
+        v1_local = (v1 - origin) @ rotation_matrix
+        v2_local = (v2 - origin) @ rotation_matrix
+        v3_local = (v3 - origin) @ rotation_matrix
+
+        v1_xy = v1_local[:, :2]
+        v2_xy = v2_local[:, :2]
+        v3_xy = v3_local[:, :2]
+
+        polygons, added = _build_polygons(v1_xy, v2_xy, v3_xy)
+        if polygons is not None:
+            polygons_buffer.append(polygons)
+            buffered_count += len(polygons)
+            projected_triangles += added
+
+        if buffered_count >= union_batch_size:
+            batch = np.concatenate(polygons_buffer)
+            polygons_buffer = []
+            buffered_count = 0
+            if len(batch) <= fast_union_threshold:
+                chunk_union = shapely_union_all(batch)
+            else:
+                chunk_union = unary_union(batch)
+            if snap_xy and snap_xy > 0:
+                chunk_union = set_precision(chunk_union, snap_xy)
+            if current_union is None:
+                current_union = chunk_union
+            else:
+                current_union = current_union.union(chunk_union)
+
+        if progress_callback:
+            progress = 10 + (chunk_end / total_triangles) * 90
+            progress_callback(progress, f"Projection: {chunk_end:,}/{total_triangles:,}")
+
+    if polygons_buffer:
+        batch = np.concatenate(polygons_buffer)
+        if len(batch) <= fast_union_threshold:
+            chunk_union = shapely_union_all(batch)
+        else:
+            chunk_union = unary_union(batch)
+        if snap_xy and snap_xy > 0:
+            chunk_union = set_precision(chunk_union, snap_xy)
+        if current_union is None:
+            current_union = chunk_union
+        else:
+            current_union = current_union.union(chunk_union)
+
+    if current_union is None or current_union.is_empty:
+        return {
+            'perimeter': 0.0,
+            'boundary_edges': 0,
+            'snap_xy': snap_xy,
+            'total_triangles': total_triangles,
+            'projected_triangles': projected_triangles,
+        }
+
+    perimeter = float(current_union.length)
+    boundary_edges = _count_boundary_segments(current_union)
+
+    return {
+        'perimeter': perimeter,
+        'boundary_edges': boundary_edges,
+        'snap_xy': snap_xy,
+        'total_triangles': total_triangles,
+        'projected_triangles': projected_triangles,
+    }
+
+
 def _run_slice_self_tests():
     """Самопроверки периметра на синтетических моделях."""
     def make_box(x0, y0, z0, x1, y1, z1):

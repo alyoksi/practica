@@ -419,14 +419,14 @@ class BoundingBoxApp(QMainWindow):
             import time
             transform_start_time = time.time()
             result = self.stl_module.calculate_parallelepiped_volume(file_path)
-            perimeter_result = self.stl_module.calculate_perimeter_aligned(
-                file_path,
-                voxel_mm=0.5,
-                grid_step=0.2,
-                delta=0.01,
-                eps=1e-6,
-                chunk_size=500000
-            )
+            perimeter_result = None
+            if self.user_type == "admin":
+                perimeter_result = self.stl_module.calculate_contact_perimeter_projected(
+                    file_path,
+                    snap_xy=0.001,
+                    chunk_size=200000,
+                    union_batch_size=20000,
+                )
             transform_end_time = time.time()
             print("---Преобразование: %s секунд ---" % (transform_end_time - transform_start_time))
             volume = result["volume"] if result else None

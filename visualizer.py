@@ -12,6 +12,9 @@ try:
     from vtkmodules.vtkRenderingAnnotation import vtkAxesActor
     from vtkmodules.vtkCommonTransforms import vtkTransform
     from vtkmodules.vtkCommonCore import vtkGlobalWarningDisplayOff, vtkOutputWindow
+    from vtkmodules.vtkFiltersCore import vtkQuadricDecimation
+    from vtkmodules.vtkRenderingLOD import vtkLODActor
+    from vtkmodules.vtkIOXML import vtkXMLPolyDataWriter, vtkXMLPolyDataReader
     VTK_MODERN = True
 except ImportError:
     # fallback для старого API
@@ -28,6 +31,10 @@ except ImportError:
     vtkAxesActor = vtk.vtkAxesActor
     vtkTransform = vtk.vtkTransform
     vtkMatrix4x4 = vtk.vtkMatrix4x4
+    vtkQuadricDecimation = vtk.vtkQuadricDecimation
+    vtkLODActor = vtk.vtkLODActor
+    vtkXMLPolyDataWriter = vtk.vtkXMLPolyDataWriter
+    vtkXMLPolyDataReader = vtk.vtkXMLPolyDataReader
     vtkGlobalWarningDisplayOff = vtk.vtkObject.GlobalWarningDisplayOff
     vtkOutputWindow = vtk.vtkOutputWindow
     VTK_MODERN = False
@@ -53,7 +60,6 @@ class STLVisualizer:
         self._setup_pipeline()
 
     def _setup_pipeline(self):
-        self.mapper.SetInputConnection(self.reader.GetOutputPort())
         self.actor.SetMapper(self.mapper)
         self.actor.GetProperty().SetColor(0.0, 0.5, 1.0)  # Blue color for better contrast
         self.actor.GetProperty().SetAmbient(0.3)
@@ -69,16 +75,71 @@ class STLVisualizer:
         self.render_window.AddRenderer(self.renderer)
         self.render_window.SetSize(400, 300)
 
-    def load_stl(self, filename):
+    def _get_cached_data_path(self, stl_filename):
+        """Generate cache file path for decimated data."""
+        base_dir = os.path.dirname(stl_filename)
+        base_name = os.path.basename(stl_filename).rsplit('.', 1)[0]
+        return os.path.join(base_dir, f"{base_name}_decimated.vtp")
+
+    def _is_cache_valid(self, stl_filename, cache_filename):
+        """Check if cache is valid (STL hasn't changed)."""
+        if not os.path.exists(cache_filename):
+            return False
+        stl_mtime = os.path.getmtime(stl_filename)
+        cache_mtime = os.path.getmtime(cache_filename)
+        return cache_mtime > stl_mtime
+
+    def _create_decimated_data(self, input_data):
+        """Decimate polydata for fast preview."""
+        decimator = vtkQuadricDecimation()
+        decimator.SetInputData(input_data)
+        # Reduce to ~1% of original triangles (configurable)
+        original_triangles = input_data.GetNumberOfCells()
+        target_reduction = 0.0  # 99% reduction
+        decimator.SetTargetReduction(target_reduction)
+        decimator.Update()
+        return decimator.GetOutput()
+
+    def load_stl(self, filename, use_cache=True, preview_mode=True):
         if not os.path.exists(filename):
             raise FileNotFoundError(f"File {filename} not found")
 
-        self.reader.SetFileName(filename)
-        self.reader.Update()
+        cached_path = self._get_cached_data_path(filename)
+        poly_data = None
+
+        if use_cache and self._is_cache_valid(filename, cached_path):
+            # Load from cache
+            reader = vtkXMLPolyDataReader()
+            reader.SetFileName(cached_path)
+            reader.Update()
+            poly_data = reader.GetOutput()
+            if preview_mode:
+                print(f"Loaded decimated mesh from cache: {cached_path}")
+        else:
+            # Load from STL
+            self.reader.SetFileName(filename)
+            self.reader.Update()
+            poly_data = self.reader.GetOutput()
+
+            if preview_mode:
+                # Decimate for preview
+                poly_data = self._create_decimated_data(poly_data)
+                # Cache decimated data
+                if use_cache:
+                    writer = vtkXMLPolyDataWriter()
+                    writer.SetFileName(cached_path)
+                    writer.SetInputData(poly_data)
+                    writer.Write()
+                    print(f"Cached decimated mesh: {cached_path}")
+
+        # Set up mapper and actor
+        self.mapper.SetInputData(poly_data)
+        self.actor.SetMapper(self.mapper)
+
         # Reset transform for new file
         self.actor.SetUserTransform(None)
         self.current_transform = None
-        
+
         # Store original bounds
         bounds = self.actor.GetBounds()
         self.original_bounds = bounds
