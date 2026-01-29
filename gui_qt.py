@@ -177,7 +177,8 @@ class DropArea(QFrame):
 
 
 class BoundingBoxApp(QMainWindow):
-    def __init__(self):
+    def __init__(self, user_type):
+        self.user_type = user_type
         super().__init__()
         self.setWindowTitle("Габариты детали")
         self.setGeometry(100, 100, 1100, 600)
@@ -354,6 +355,9 @@ class BoundingBoxApp(QMainWindow):
         parent_layout.addWidget(frame)
 
     def _create_extra_block(self, parent_layout, name, unit, attr):
+        if attr == "perimeter" and self.user_type == "general":
+            return
+
         frame = QFrame()
         frame_layout = QVBoxLayout(frame)
         frame_layout.setContentsMargins(8, 8, 8, 8)
@@ -480,7 +484,8 @@ class BoundingBoxApp(QMainWindow):
         self.y_unit_label.setText(unit)
         self.z_unit_label.setText(unit)
         self.volume_unit_label.setText(f"{unit}³")
-        self.perimeter_unit_label.setText(unit)
+        if hasattr(self, 'perimeter_unit_label'):
+            self.perimeter_unit_label.setText(unit)
 
         # Линейные размеры
         self._updating_display = True
@@ -512,11 +517,12 @@ class BoundingBoxApp(QMainWindow):
         else:
             self.volume_label.setText("—")
 
-        if self.raw_perimeter is not None:
-            conv_perimeter = _convert_value(self.raw_perimeter, "мм", unit)
-            self.perimeter_label.setText(_format_dimension(conv_perimeter, unit))
-        else:
-            self.perimeter_label.setText("—")
+        if hasattr(self, 'perimeter_label'):
+            if self.raw_perimeter is not None:
+                conv_perimeter = _convert_value(self.raw_perimeter, "мм", unit)
+                self.perimeter_label.setText(_format_dimension(conv_perimeter, unit))
+            else:
+                self.perimeter_label.setText("—")
 
     def _clear_raw(self):
         self.raw_x = None
@@ -674,7 +680,7 @@ def main():
         sys.exit(0)
     
     # Создаем и показываем главное окно
-    window = BoundingBoxApp()
+    window = BoundingBoxApp(user_type)
     window.show()
     sys.exit(app.exec())
 
