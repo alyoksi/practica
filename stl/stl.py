@@ -560,13 +560,6 @@ def _iter_stl_chunks_auto(filename, chunk_size=500000):
             yield chunk_start, chunk_end, total_triangles, v1, v2, v3
 
 
-def _calculate_triangle_area_from_vertices(v1, v2, v3):
-    """Вычисление площади треугольника по трем вершинам."""
-    edge1 = v2 - v1
-    edge2 = v3 - v1
-    cross = np.cross(edge1, edge2)
-    return 0.5 * np.linalg.norm(cross)
-
 
 def calculate_parallelepiped_volume_streaming(
     filename,
@@ -789,25 +782,13 @@ def calculate_aligned_bounding_box_optimized_large(unique_vertices, normal_vecto
     return min_coords, max_coords, best_rotation
 
 
-def get_bounding_box_dimensions_streaming(filename, *, aligned=True, progress_callback=None):
+def get_bounding_box_dimensions_streaming(filename, progress_callback=None):
     """Потоковая версия get_bounding_box_dimensions."""
-    if not aligned:
-        # Для невращаемого бокса
-        max_info, unique_vertices, total_triangles = _parse_stl_binary_streaming(
-            filename, progress_callback=progress_callback
-        )
-        if len(unique_vertices) == 0:
-            return None
-        min_coords = unique_vertices.min(axis=0)
-        max_coords = unique_vertices.max(axis=0)
-        dimensions = max_coords - min_coords
-        return dimensions[0], dimensions[1], dimensions[2]
-    else:
-        result = calculate_parallelepiped_volume_streaming(filename, progress_callback)
-        if not result:
-            return None
-        dims = result['dimensions']
-        return dims[0], dims[1], dims[2]
+    result = calculate_parallelepiped_volume_streaming(filename, progress_callback)
+    if not result:
+        return None
+    dims = result['dimensions']
+    return dims[0], dims[1], dims[2]
 
 
 def _parse_stl_binary_vectorized(filename):
@@ -1422,19 +1403,7 @@ def calculate_aligned_bounding_box(triangles, normal_vector, origin):
     return min_coords, max_coords, best_rotation
 
 
-def calculate_nonrotated_bounding_box(triangles):
-    """Осеориентированный бокс (без вращения)."""
-    unique_vertices = set()
-    for triangle in triangles:
-        for vertex in triangle["vertices"]:
-            unique_vertices.add(tuple(vertex))
 
-    all_vertices = np.array([list(v) for v in unique_vertices])
-
-    min_coords = np.min(all_vertices, axis=0)
-    max_coords = np.max(all_vertices, axis=0)
-
-    return min_coords, max_coords
 
 
 def calculate_parallelepiped_volume(filename):
@@ -1482,33 +1451,12 @@ def calculate_parallelepiped_volume(filename):
     }
 
 
-def calculate_nonrotated_volume(filename):
-    """Объём осеориентированного бокса (без вращения)."""
-    triangles = parse_stl(filename)
-
-    if not triangles:
-        return None
-
-    min_coords, max_coords = calculate_nonrotated_bounding_box(triangles)
-
-    dimensions = max_coords - min_coords
-
-    volume = dimensions[0] * dimensions[1] * dimensions[2]
-
-    return {
-        "min_coords": min_coords,
-        "max_coords": max_coords,
-        "dimensions": dimensions,
-        "volume": volume,
-    }
 
 
-def get_bounding_box_dimensions(filename, *, aligned=True):
+
+def get_bounding_box_dimensions(filename):
     """Вернуть размеры габаритного бокса (X, Y, Z) для STL."""
-    if aligned:
-        result = calculate_parallelepiped_volume(filename)
-    else:
-        result = calculate_nonrotated_volume(filename)
+    result = calculate_parallelepiped_volume(filename)
 
     if not result:
         return None
@@ -1524,96 +1472,20 @@ def main():
         print("Использование: python stl.py <stl_file> [опции]")
         print("Опции:")
         print("  --volume          Рассчитать объём ориентированного параллелепипеда")
-        print("  --nonrot-volume   Рассчитать объём осеориентированного бокса")
         print("  --perimeter-z0    Рассчитать периметр отпечатка на плоскости Z=0")
-        print("  --voxel-mm <mm>   Шаг квантования для voxel thinning (по умолчанию 0.5)")
-        print("  --grid-step <mm>  Шаг квантования для периметра (по умолчанию 0.2)")
-        print("  --delta <mm>      Сдвиг плоскости для реза (по умолчанию 0.01)")
-        print("  --eps <mm>        Допуск при резе (по умолчанию 1e-6)")
-        print("  --z-plane <mm>    Плоскость для периметра (по умолчанию 0.0)")
-        print("  --chunk-size <n>  Размер чанка треугольников для стриминга")
-        print("  --self-test       Запуск самопроверок")
-        print("  --slice-test      Запуск самопроверок периметра")
         print("\nПримеры:")
         print("  python stl.py model.stl")
         print("  python stl.py model.stl --volume")
-        print("  python stl.py model.stl --nonrot-volume")
-        print("  python stl.py model.stl --perimeter-z0 --grid-step 0.2")
+        print("  python stl.py model.stl --perimeter-z0")
         return
 
     filename = sys.argv[1]
     calculate_volume = "--volume" in sys.argv
-    calculate_nonrot_volume = "--nonrot-volume" in sys.argv
-    calculate_perimeter = "--perimeter-z0" in sys.argv
-    run_self_test = "--self-test" in sys.argv
-    run_slice_test = "--slice-test" in sys.argv
-
-    voxel_mm = 0.5
-    grid_step = 0.2
-    delta = 0.01
-    eps = 1e-6
-    z_plane = 0.0
-    chunk_size = 500000
-    if "--voxel-mm" in sys.argv:
-        idx = sys.argv.index("--voxel-mm")
-        if idx + 1 < len(sys.argv):
-            voxel_mm = float(sys.argv[idx + 1])
-    if "--grid-step" in sys.argv:
-        idx = sys.argv.index("--grid-step")
-        if idx + 1 < len(sys.argv):
-            grid_step = float(sys.argv[idx + 1])
-    if "--delta" in sys.argv:
-        idx = sys.argv.index("--delta")
-        if idx + 1 < len(sys.argv):
-            delta = float(sys.argv[idx + 1])
-    if "--eps" in sys.argv:
-        idx = sys.argv.index("--eps")
-        if idx + 1 < len(sys.argv):
-            eps = float(sys.argv[idx + 1])
-    if "--z-plane" in sys.argv:
-        idx = sys.argv.index("--z-plane")
-        if idx + 1 < len(sys.argv):
-            z_plane = float(sys.argv[idx + 1])
-    if "--chunk-size" in sys.argv:
-        idx = sys.argv.index("--chunk-size")
-        if idx + 1 < len(sys.argv):
-            chunk_size = int(sys.argv[idx + 1])
+    calculate_perimeter = "--perimeter" in sys.argv
 
     try:
-        if run_self_test:
-            _run_self_checks()
-            return
-        if run_slice_test:
-            _run_slice_self_tests()
-            return
-        if calculate_nonrot_volume:
-            result = calculate_nonrotated_volume(filename)
-
-            if result:
-                print("\n" + "=" * 60)
-                print("Осеориентированный бокс (без вращения)")
-                print("=" * 60)
-                print("\nРазмеры бокса:")
-                print(
-                    "  Габариты (X, Y, Z): "
-                    f"[{result['dimensions'][0]:.6f}, {result['dimensions'][1]:.6f}, {result['dimensions'][2]:.6f}]"
-                )
-                print(
-                    "  Минимальный угол: "
-                    f"[{result['min_coords'][0]:.6f}, {result['min_coords'][1]:.6f}, {result['min_coords'][2]:.6f}]"
-                )
-                print(
-                    "  Максимальный угол: "
-                    f"[{result['max_coords'][0]:.6f}, {result['max_coords'][1]:.6f}, {result['max_coords'][2]:.6f}]"
-                )
-                print(f"\n  ОБЪЁМ: {result['volume']:.6f}")
-                print("=" * 60)
-        elif calculate_volume:
-            result = calculate_parallelepiped_volume_streaming(
-                filename,
-                voxel_mm=voxel_mm,
-                chunk_size=chunk_size
-            )
+        if calculate_volume:
+            result = calculate_parallelepiped_volume_streaming(filename)
 
             if result:
                 print("\n" + "=" * 60)
@@ -1638,14 +1510,7 @@ def main():
                 print(f"\n  ОБЪЁМ: {result['volume']:.6f}")
                 print("=" * 60)
         elif calculate_perimeter:
-            result = calculate_perimeter_aligned(
-                filename,
-                voxel_mm=voxel_mm,
-                grid_step=grid_step,
-                delta=delta,
-                eps=eps,
-                chunk_size=chunk_size
-            )
+            result = calculate_perimeter_aligned(filename)
 
             if result:
                 print("\n" + "=" * 60)
