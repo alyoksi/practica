@@ -8,24 +8,9 @@ import math
 
 
 
-
-
-
-
-def _count_boundary_segments(geometry):
-    if geometry.is_empty:
-        return 0
-    boundary = geometry.boundary
-    if boundary.geom_type == "LineString":
-        return max(0, len(boundary.coords) - 1)
-    if boundary.geom_type == "MultiLineString":
-        return sum(max(0, len(line.coords) - 1) for line in boundary.geoms)
-    return 0
-
-
 try:
     from numba import njit
-    _NUMBA_AVAILABLE = True
+    _NUMBA_AVAILABLE = True 
 except Exception:
     _NUMBA_AVAILABLE = False
 
@@ -757,6 +742,64 @@ def create_coordinate_system_from_triangle_vectorized(triangle_vertices):
     return rotation_matrix, v1
 
 
+def _convex_hull_monotone_chain(points):
+    """
+    Вычисление выпуклой оболочки 2D точек по алгоритму Эндрю (monotone chain).
+    Возвращает вершины оболочки в порядке против часовой стрелки.
+    Если все точки коллинеарны, возвращает крайние точки.
+    """
+    pts = np.asarray(points)
+    if pts.shape[0] < 3:
+        return pts
+    
+    # Сортируем по x, затем по y
+    order = np.lexsort((pts[:, 1], pts[:, 0]))
+    pts_sorted = pts[order]
+    
+    # Удаляем дубликаты (точки с одинаковыми координатами)
+    # Используем разность по модулю, чтобы учесть численные погрешности
+    eps = 1e-12
+    diff = np.diff(pts_sorted, axis=0)
+    keep = np.any(np.abs(diff) > eps, axis=1)
+    # Первая точка всегда включается
+    keep = np.concatenate([[True], keep])
+    pts_unique = pts_sorted[keep]
+    
+    if pts_unique.shape[0] < 3:
+        return pts_unique
+    
+    # Нижняя оболочка
+    lower = []
+    for p in pts_unique:
+        while len(lower) >= 2:
+            v1 = lower[-1] - lower[-2]
+            v2 = p - lower[-2]
+            cross = v1[0] * v2[1] - v1[1] * v2[0]
+            if cross <= eps:
+                lower.pop()
+            else:
+                break
+        lower.append(p)
+    
+    # Верхняя оболочка
+    upper = []
+    for p in reversed(pts_unique):
+        while len(upper) >= 2:
+            v1 = upper[-1] - upper[-2]
+            v2 = p - upper[-2]
+            cross = v1[0] * v2[1] - v1[1] * v2[0]
+            if cross <= eps:
+                upper.pop()
+            else:
+                break
+        upper.append(p)
+    
+    # Объединяем нижнюю и верхнюю оболочки, удаляя последнюю точку верхней оболочки,
+    # так как она совпадает с первой точкой нижней.
+    hull = np.vstack([lower[:-1], upper[:-1]])
+    return hull
+
+
 def compute_convex_hull_2d(points):
     """
     Вычисление 2D выпуклой оболочки точек с использованием SciPy.
@@ -765,13 +808,41 @@ def compute_convex_hull_2d(points):
     """
     if len(points) < 3:
         return points
-
+    
+    pts = np.asarray(points, dtype=np.float64)
+    
+    # 1. Удаление дубликатов с учётом квантования voxel_mm
+    # Поскольку точки уже квантованы (voxel_keys), просто используем уникальные координаты
+    pts_unique = np.unique(pts, axis=0)
+    
+    # 2. Ограничение размера выборки для предотвращения ошибок Qhull
+    MAX_HULL_POINTS = 500_000
+    if pts_unique.shape[0] > MAX_HULL_POINTS:
+        # Случайная выборка с сохранением равномерного распределения
+        rng = np.random.default_rng(seed=42)
+        indices = rng.choice(pts_unique.shape[0], size=MAX_HULL_POINTS, replace=False)
+        pts_unique = pts_unique[indices]
+    
+    # 3. Попытка SciPy ConvexHull с опцией "QJ" (joggle) для улучшения устойчивости
     try:
-        hull = ConvexHull(points)
-        return points[hull.vertices]
-    except:
-        # Резервный вариант: вернуть оригинальные точки, если оболочка не удалась
-        return points
+        hull = ConvexHull(pts_unique, qhull_options="QJ")
+        hull_points = pts_unique[hull.vertices]
+        # Проверяем направление обхода (должно быть против часовой стрелки)
+        # Если площадь отрицательна, меняем порядок
+        if len(hull_points) >= 3:
+            # Вычисляем знак площади (формула шнурования)
+            total = 0.0
+            for i in range(len(hull_points)):
+                x1, y1 = hull_points[i]
+                x2, y2 = hull_points[(i + 1) % len(hull_points)]
+                total += (x2 - x1) * (y2 + y1)
+            if total < 0:  # по часовой стрелке
+                hull_points = hull_points[::-1]
+        return hull_points
+    except Exception:
+        # 4. Резервный вариант: monotone chain
+        hull_points = _convex_hull_monotone_chain(pts_unique)
+        return hull_points
 
 
 def _remove_collinear_ccw(points, tol=1e-12):
