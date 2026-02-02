@@ -7,258 +7,9 @@ import collections
 import math
 
 
-def _edge_plane_intersections(va, vb, da, db, eps):
-    """Вычислить точки пересечения ребра с плоскостью для массива рёбер."""
-    near_a = np.abs(da) <= eps
-    near_b = np.abs(db) <= eps
-    edge_mask = (da * db < 0) | near_a | near_b
-    edge_mask &= ~(near_a & near_b)
-    denom = da - db
-    valid = edge_mask & (np.abs(denom) > eps)
-    t = np.zeros_like(da)
-    t[valid] = da[valid] / denom[valid]
-    pts = va + (vb - va) * t[:, np.newaxis]
-    pts_2d = pts[:, :2]
-    pts_2d[~edge_mask] = np.nan
-    return pts_2d
 
 
-def _slice_triangle_arrays(v1, v2, v3, plane_z, eps, grid_step):
-    """Сегменты пересечения для массивов треугольников."""
-    if len(v1) == 0:
-        return []
 
-    d1 = v1[:, 2] - plane_z
-    d2 = v2[:, 2] - plane_z
-    d3 = v3[:, 2] - plane_z
-
-    p12 = _edge_plane_intersections(v1, v2, d1, d2, eps)
-    p23 = _edge_plane_intersections(v2, v3, d2, d3, eps)
-    p31 = _edge_plane_intersections(v3, v1, d3, d1, eps)
-
-    valid12 = ~np.isnan(p12[:, 0])
-    valid23 = ~np.isnan(p23[:, 0])
-    valid31 = ~np.isnan(p31[:, 0])
-    counts = valid12.astype(np.int32) + valid23.astype(np.int32) + valid31.astype(np.int32)
-    indices = np.where(counts >= 2)[0]
-
-    segments = []
-    for idx in indices:
-        pts = []
-        if valid12[idx]:
-            pts.append(p12[idx])
-        if valid23[idx]:
-            pts.append(p23[idx])
-        if valid31[idx]:
-            pts.append(p31[idx])
-
-        keys = []
-        for pt in pts:
-            key = (int(np.rint(pt[0] / grid_step)), int(np.rint(pt[1] / grid_step)))
-            if key not in keys:
-                keys.append(key)
-
-        if len(keys) < 2:
-            continue
-        if len(keys) > 2:
-            max_d = -1
-            best_pair = None
-            for i in range(len(keys)):
-                for j in range(i + 1, len(keys)):
-                    dx = keys[i][0] - keys[j][0]
-                    dy = keys[i][1] - keys[j][1]
-                    dist = dx * dx + dy * dy
-                    if dist > max_d:
-                        max_d = dist
-                        best_pair = (keys[i], keys[j])
-            if best_pair:
-                segments.append(best_pair)
-        else:
-            segments.append((keys[0], keys[1]))
-
-    return segments
-
-
-def slice_stl_plane_segments_binary(filename, z_plane=0.0, eps=1e-6, delta=0.01,
-                                    grid_step=0.2, chunk_size=500000, progress_callback=None,
-                                    max_segments=5_000_000, rotation_matrix=None,
-                                    origin=None, plane_in_aligned=False):
-    """
-    Потоковое вычисление отрезков пересечения STL с плоскостью Z=z_plane.
-    Возвращает: (segments, total_triangles, total_segments)
-    segments: список пар ((x1,y1),(x2,y2)) в виде целых ключей сетки.
-    """
-    plane_z = float(z_plane) + float(delta)
-
-    segments = []
-    total_triangles = 0
-
-    for chunk_start, chunk_end, total_triangles, v1, v2, v3 in _iter_stl_chunks_auto(
-        filename, chunk_size=chunk_size
-    ):
-        if plane_in_aligned and rotation_matrix is not None and origin is not None:
-            v1 = (v1 - origin) @ rotation_matrix
-            v2 = (v2 - origin) @ rotation_matrix
-            v3 = (v3 - origin) @ rotation_matrix
-
-        z1 = v1[:, 2]
-        z2 = v2[:, 2]
-        z3 = v3[:, 2]
-
-        z_min = np.minimum(np.minimum(z1, z2), z3)
-        z_max = np.maximum(np.maximum(z1, z2), z3)
-        mask = (z_max >= plane_z - eps) & (z_min <= plane_z + eps)
-        if mask.any():
-            chunk_segments = _slice_triangle_arrays(
-                v1[mask], v2[mask], v3[mask], plane_z, eps, grid_step
-            )
-            segments.extend(chunk_segments)
-            if len(segments) > max_segments:
-                raise MemoryError(
-                    f"Too many segments ({len(segments)}). Increase grid_step or use coarser slice."
-                )
-
-        if progress_callback:
-            progress = (chunk_end / total_triangles) * 100
-            progress_callback(progress, f"Slicing: {chunk_end:,}/{total_triangles:,}")
-
-    return segments, total_triangles, len(segments)
-
-
-def calculate_perimeter_aligned(filename, *, voxel_mm=0.5, grid_step=0.2,
-                                delta=0.01, eps=1e-6, chunk_size=500000,
-                                progress_callback=None):
-    """Периметр отпечатка после выравнивания по OBB (плоскость низа)."""
-    aligned = calculate_parallelepiped_volume_streaming(
-        filename,
-        voxel_mm=voxel_mm,
-        chunk_size=chunk_size,
-        pass_c=True,
-    )
-    if not aligned:
-        return None
-
-    rotation_matrix = np.asarray(aligned['rotation_matrix'], dtype=np.float64)
-    origin = np.asarray(aligned['origin'], dtype=np.float64)
-    min_z = float(aligned['min_coords'][2])
-
-    segments, total_triangles, total_segments = slice_stl_plane_segments_binary(
-        filename,
-        z_plane=min_z,
-        eps=eps,
-        delta=delta,
-        grid_step=grid_step,
-        chunk_size=chunk_size,
-        progress_callback=progress_callback,
-        rotation_matrix=rotation_matrix,
-        origin=origin,
-        plane_in_aligned=True,
-    )
-
-    loops = _build_contours_from_segments(segments, grid_step=grid_step)
-    perimeter = perimeter_from_loops(loops)
-    return {
-        'total_triangles': total_triangles,
-        'segments_count': total_segments,
-        'loops_count': len(loops),
-        'perimeter': perimeter,
-        'loops': loops,
-        'grid_step': grid_step,
-        'z_plane': min_z,
-        'delta': delta,
-        'rotation_matrix': rotation_matrix,
-        'origin': origin,
-    }
-
-
-def _build_contours_from_segments(segments, grid_step):
-    """Сборка замкнутых контуров из списка отрезков."""
-    # Построение графа смежности
-    adj = collections.defaultdict(list)
-    for (x1, y1), (x2, y2) in segments:
-        key1 = (x1, y1)
-        key2 = (x2, y2)
-        adj[key1].append(key2)
-        adj[key2].append(key1)
-
-    visited_edges = set()
-    loops = []
-
-    for start_key in list(adj.keys()):
-        for neighbor in adj[start_key]:
-            edge = (start_key, neighbor) if start_key < neighbor else (neighbor, start_key)
-            if edge in visited_edges:
-                continue
-            visited_edges.add(edge)
-            path = [start_key, neighbor]
-            prev = start_key
-            curr = neighbor
-
-            while True:
-                next_key = None
-                for nb in adj[curr]:
-                    edge_nb = (curr, nb) if curr < nb else (nb, curr)
-                    if edge_nb in visited_edges:
-                        continue
-                    next_key = nb
-                    visited_edges.add(edge_nb)
-                    break
-
-                if next_key is None:
-                    break
-
-                path.append(next_key)
-                prev, curr = curr, next_key
-
-                if curr == start_key:
-                    loops.append(path[:-1])
-                    break
-
-    loops_pts = []
-    for loop in loops:
-        coords = np.array([[p[0] * grid_step, p[1] * grid_step] for p in loop], dtype=np.float64)
-        loops_pts.append(coords)
-    return loops_pts
-
-
-def perimeter_from_loops(loops, min_perimeter=1.0):
-    """Суммарный периметр всех контуров."""
-    total = 0.0
-    for loop in loops:
-        if len(loop) < 2:
-            continue
-        perim = 0.0
-        prev = loop[-1]
-        for curr in loop:
-            dx = curr[0] - prev[0]
-            dy = curr[1] - prev[1]
-            perim += math.hypot(dx, dy)
-            prev = curr
-        if perim >= min_perimeter:
-            total += perim
-    return total
-
-
-def calculate_perimeter_z0(filename, z_plane=0.0, delta=0.01, grid_step=0.2,
-                           eps=1e-6, chunk_size=500000, progress_callback=None):
-    """Основная функция для вычисления периметра отпечатка на плоскости Z."""
-    segments, total_triangles, total_segments = slice_stl_plane_segments_binary(
-        filename, z_plane=z_plane, eps=eps, delta=delta,
-        grid_step=grid_step, chunk_size=chunk_size,
-        progress_callback=progress_callback
-    )
-    loops = _build_contours_from_segments(segments, grid_step=grid_step)
-    perimeter = perimeter_from_loops(loops)
-    return {
-        'total_triangles': total_triangles,
-        'segments_count': total_segments,
-        'loops_count': len(loops),
-        'perimeter': perimeter,
-        'loops': loops,
-        'grid_step': grid_step,
-        'z_plane': z_plane,
-        'delta': delta,
-    }
 
 
 def _count_boundary_segments(geometry):
@@ -272,24 +23,112 @@ def _count_boundary_segments(geometry):
     return 0
 
 
+try:
+    from numba import njit
+    _NUMBA_AVAILABLE = True
+except Exception:
+    _NUMBA_AVAILABLE = False
+
+
+if _NUMBA_AVAILABLE:
+    @njit(cache=True)
+    def _rasterize_triangles_numba(grid, v1_xy, v2_xy, v3_xy, min_x, min_y, cell_mm):
+        rows, cols = grid.shape
+        for i in range(v1_xy.shape[0]):
+            x1, y1 = v1_xy[i, 0], v1_xy[i, 1]
+            x2, y2 = v2_xy[i, 0], v2_xy[i, 1]
+            x3, y3 = v3_xy[i, 0], v3_xy[i, 1]
+
+            minx = x1 if x1 < x2 else x2
+            minx = minx if minx < x3 else x3
+            maxx = x1 if x1 > x2 else x2
+            maxx = maxx if maxx > x3 else x3
+            miny = y1 if y1 < y2 else y2
+            miny = miny if miny < y3 else y3
+            maxy = y1 if y1 > y2 else y2
+            maxy = maxy if maxy > y3 else y3
+
+            ix0 = int(np.floor((minx - min_x) / cell_mm))
+            ix1 = int(np.floor((maxx - min_x) / cell_mm))
+            iy0 = int(np.floor((miny - min_y) / cell_mm))
+            iy1 = int(np.floor((maxy - min_y) / cell_mm))
+
+            if ix1 < 0 or iy1 < 0 or ix0 >= cols or iy0 >= rows:
+                continue
+            if ix0 < 0:
+                ix0 = 0
+            if iy0 < 0:
+                iy0 = 0
+            if ix1 >= cols:
+                ix1 = cols - 1
+            if iy1 >= rows:
+                iy1 = rows - 1
+
+            for yy in range(iy0, iy1 + 1):
+                py = min_y + (yy + 0.5) * cell_mm
+                for xx in range(ix0, ix1 + 1):
+                    px = min_x + (xx + 0.5) * cell_mm
+                    d1 = (px - x2) * (y1 - y2) - (x1 - x2) * (py - y2)
+                    d2 = (px - x3) * (y2 - y3) - (x2 - x3) * (py - y3)
+                    d3 = (px - x1) * (y3 - y1) - (x3 - x1) * (py - y1)
+                    has_neg = (d1 < 0.0) or (d2 < 0.0) or (d3 < 0.0)
+                    has_pos = (d1 > 0.0) or (d2 > 0.0) or (d3 > 0.0)
+                    if not (has_neg and has_pos):
+                        grid[yy, xx] = True
+
+
+def _rasterize_triangles_numpy(grid, v1_xy, v2_xy, v3_xy, min_x, min_y, cell_mm):
+    rows, cols = grid.shape
+    for i in range(v1_xy.shape[0]):
+        x1, y1 = v1_xy[i]
+        x2, y2 = v2_xy[i]
+        x3, y3 = v3_xy[i]
+
+        minx = min(x1, x2, x3)
+        maxx = max(x1, x2, x3)
+        miny = min(y1, y2, y3)
+        maxy = max(y1, y2, y3)
+
+        ix0 = int(np.floor((minx - min_x) / cell_mm))
+        ix1 = int(np.floor((maxx - min_x) / cell_mm))
+        iy0 = int(np.floor((miny - min_y) / cell_mm))
+        iy1 = int(np.floor((maxy - min_y) / cell_mm))
+
+        if ix1 < 0 or iy1 < 0 or ix0 >= cols or iy0 >= rows:
+            continue
+        ix0 = max(ix0, 0)
+        iy0 = max(iy0, 0)
+        ix1 = min(ix1, cols - 1)
+        iy1 = min(iy1, rows - 1)
+
+        xs = np.arange(ix0, ix1 + 1)
+        ys = np.arange(iy0, iy1 + 1)
+        px = min_x + (xs + 0.5) * cell_mm
+        py = min_y + (ys + 0.5) * cell_mm
+        px_grid, py_grid = np.meshgrid(px, py)
+
+        d1 = (px_grid - x2) * (y1 - y2) - (x1 - x2) * (py_grid - y2)
+        d2 = (px_grid - x3) * (y2 - y3) - (x2 - x3) * (py_grid - y3)
+        d3 = (px_grid - x1) * (y3 - y1) - (x3 - x1) * (py_grid - y1)
+        mask = ((d1 >= 0) & (d2 >= 0) & (d3 >= 0)) | ((d1 <= 0) & (d2 <= 0) & (d3 <= 0))
+
+        grid[np.ix_(ys, xs)] |= mask
+
+
 def calculate_contact_perimeter_projected(
     filename,
     *,
-    snap_xy=0.001,
+    cell_mm=1.0,
     chunk_size=500000,
-    union_batch_size=20000,
-    fast_union_threshold=50000,
+    max_cells=10_000_000,
     progress_callback=None,
 ):
     """
-    Периметр контакта как длина границы объединения проекций треугольников
-    на плоскость максимального треугольника.
-    Возвращает dict: perimeter, boundary_edges, snap_xy, total_triangles, projected_triangles.
+    Быстрый оценочный периметр контакта через растровую сетку.
+    Возвращает dict: perimeter_mm, cell_mm, total_triangles, projected_triangles.
     """
-    from shapely import polygons as shapely_polygons
-    from shapely import set_precision
-    from shapely import union_all as shapely_union_all
-    from shapely.ops import unary_union
+    from skimage.measure import perimeter_crofton
+    import tempfile
 
     max_area = 0.0
     max_vertices = None
@@ -321,28 +160,10 @@ def calculate_contact_perimeter_projected(
 
     rotation_matrix, origin = create_coordinate_system_from_triangle_vectorized(max_vertices)
 
-    current_union = None
-    projected_triangles = 0
-    polygons_buffer = []
-    buffered_count = 0
-
-    def _build_polygons(v1_xy, v2_xy, v3_xy):
-        if snap_xy and snap_xy > 0:
-            v1_xy = np.round(v1_xy / snap_xy) * snap_xy
-            v2_xy = np.round(v2_xy / snap_xy) * snap_xy
-            v3_xy = np.round(v3_xy / snap_xy) * snap_xy
-
-        area2 = np.abs(
-            (v2_xy[:, 0] - v1_xy[:, 0]) * (v3_xy[:, 1] - v1_xy[:, 1])
-            - (v2_xy[:, 1] - v1_xy[:, 1]) * (v3_xy[:, 0] - v1_xy[:, 0])
-        )
-        valid = area2 > 1e-12
-        if not np.any(valid):
-            return None, 0
-
-        coords = np.stack([v1_xy[valid], v2_xy[valid], v3_xy[valid]], axis=1)
-        polygons = shapely_polygons(coords)
-        return polygons, int(np.sum(valid))
+    min_x = np.inf
+    min_y = np.inf
+    max_x = -np.inf
+    max_y = -np.inf
 
     for chunk_start, chunk_end, total_triangles, v1, v2, v3 in _iter_stl_chunks_auto(
         filename, chunk_size=chunk_size
@@ -355,149 +176,79 @@ def calculate_contact_perimeter_projected(
         v2_xy = v2_local[:, :2]
         v3_xy = v3_local[:, :2]
 
-        polygons, added = _build_polygons(v1_xy, v2_xy, v3_xy)
-        if polygons is not None:
-            polygons_buffer.append(polygons)
-            buffered_count += len(polygons)
-            projected_triangles += added
-
-        if buffered_count >= union_batch_size:
-            batch = np.concatenate(polygons_buffer)
-            polygons_buffer = []
-            buffered_count = 0
-            if len(batch) <= fast_union_threshold:
-                chunk_union = shapely_union_all(batch)
-            else:
-                chunk_union = unary_union(batch)
-            if snap_xy and snap_xy > 0:
-                chunk_union = set_precision(chunk_union, snap_xy)
-            if current_union is None:
-                current_union = chunk_union
-            else:
-                current_union = current_union.union(chunk_union)
+        min_x = min(min_x, v1_xy[:, 0].min(), v2_xy[:, 0].min(), v3_xy[:, 0].min())
+        min_y = min(min_y, v1_xy[:, 1].min(), v2_xy[:, 1].min(), v3_xy[:, 1].min())
+        max_x = max(max_x, v1_xy[:, 0].max(), v2_xy[:, 0].max(), v3_xy[:, 0].max())
+        max_y = max(max_y, v1_xy[:, 1].max(), v2_xy[:, 1].max(), v3_xy[:, 1].max())
 
         if progress_callback:
-            progress = 10 + (chunk_end / total_triangles) * 90
-            progress_callback(progress, f"Projection: {chunk_end:,}/{total_triangles:,}")
+            progress = 10 + (chunk_end / total_triangles) * 20
+            progress_callback(progress, f"Bounds: {chunk_end:,}/{total_triangles:,}")
 
-    if polygons_buffer:
-        batch = np.concatenate(polygons_buffer)
-        if len(batch) <= fast_union_threshold:
-            chunk_union = shapely_union_all(batch)
-        else:
-            chunk_union = unary_union(batch)
-        if snap_xy and snap_xy > 0:
-            chunk_union = set_precision(chunk_union, snap_xy)
-        if current_union is None:
-            current_union = chunk_union
-        else:
-            current_union = current_union.union(chunk_union)
+    if not np.isfinite(min_x) or not np.isfinite(min_y):
+        return None
 
-    if current_union is None or current_union.is_empty:
+    width = max_x - min_x
+    height = max_y - min_y
+    if width <= 0 or height <= 0:
         return {
-            'perimeter': 0.0,
-            'boundary_edges': 0,
-            'snap_xy': snap_xy,
+            'perimeter_mm': 0.0,
+            'cell_mm': cell_mm,
             'total_triangles': total_triangles,
-            'projected_triangles': projected_triangles,
+            'projected_triangles': 0,
         }
 
-    perimeter = float(current_union.length)
-    boundary_edges = _count_boundary_segments(current_union)
+    cols = int(np.ceil(width / cell_mm)) + 2
+    rows = int(np.ceil(height / cell_mm)) + 2
+    total_cells = rows * cols
+
+    if total_cells > max_cells:
+        temp_file = tempfile.NamedTemporaryFile(suffix=".dat", delete=False)
+        temp_file.close()
+        grid = np.memmap(temp_file.name, dtype=np.bool_, mode="w+", shape=(rows, cols))
+    else:
+        grid = np.zeros((rows, cols), dtype=np.bool_)
+
+    projected_triangles = 0
+    for chunk_start, chunk_end, total_triangles, v1, v2, v3 in _iter_stl_chunks_auto(
+        filename, chunk_size=chunk_size
+    ):
+        v1_local = (v1 - origin) @ rotation_matrix
+        v2_local = (v2 - origin) @ rotation_matrix
+        v3_local = (v3 - origin) @ rotation_matrix
+
+        v1_xy = v1_local[:, :2]
+        v2_xy = v2_local[:, :2]
+        v3_xy = v3_local[:, :2]
+
+        area2 = np.abs(
+            (v2_xy[:, 0] - v1_xy[:, 0]) * (v3_xy[:, 1] - v1_xy[:, 1])
+            - (v2_xy[:, 1] - v1_xy[:, 1]) * (v3_xy[:, 0] - v1_xy[:, 0])
+        )
+        valid = area2 > 1e-5
+        if np.any(valid):
+            projected_triangles += int(np.sum(valid))
+            v1_valid = v1_xy[valid]
+            v2_valid = v2_xy[valid]
+            v3_valid = v3_xy[valid]
+            if _NUMBA_AVAILABLE:
+                _rasterize_triangles_numba(grid, v1_valid, v2_valid, v3_valid, min_x, min_y, cell_mm)
+            else:
+                _rasterize_triangles_numpy(grid, v1_valid, v2_valid, v3_valid, min_x, min_y, cell_mm)
+
+        if progress_callback:
+            progress = 30 + (chunk_end / total_triangles) * 70
+            progress_callback(progress, f"Raster: {chunk_end:,}/{total_triangles:,}")
+
+    perimeter_pixels = float(perimeter_crofton(grid.astype(np.uint8), directions=4))
+    perimeter_mm = perimeter_pixels * cell_mm
 
     return {
-        'perimeter': perimeter,
-        'boundary_edges': boundary_edges,
-        'snap_xy': snap_xy,
+        'perimeter_mm': perimeter_mm,
+        'cell_mm': cell_mm,
         'total_triangles': total_triangles,
         'projected_triangles': projected_triangles,
     }
-
-
-def _run_slice_self_tests():
-    """Самопроверки периметра на синтетических моделях."""
-    def make_box(x0, y0, z0, x1, y1, z1):
-        v = np.array([
-            [x0, y0, z0],
-            [x1, y0, z0],
-            [x1, y1, z0],
-            [x0, y1, z0],
-            [x0, y0, z1],
-            [x1, y0, z1],
-            [x1, y1, z1],
-            [x0, y1, z1],
-        ], dtype=np.float64)
-        tris = []
-        # нижняя
-        tris += [[v[0], v[1], v[2]], [v[0], v[2], v[3]]]
-        # верхняя
-        tris += [[v[4], v[6], v[5]], [v[4], v[7], v[6]]]
-        # стороны
-        tris += [[v[0], v[5], v[1]], [v[0], v[4], v[5]]]
-        tris += [[v[1], v[6], v[2]], [v[1], v[5], v[6]]]
-        tris += [[v[2], v[7], v[3]], [v[2], v[6], v[7]]]
-        tris += [[v[3], v[4], v[0]], [v[3], v[7], v[4]]]
-        return np.array(tris, dtype=np.float64)
-
-    grid_step = 0.2
-    delta = 0.01
-    eps = 1e-6
-
-    # Куб 10x10x10 на плоскости
-    cube = make_box(0, 0, 0, 10, 10, 10)
-    v1, v2, v3 = cube[:, 0], cube[:, 1], cube[:, 2]
-    segments = _slice_triangle_arrays(v1, v2, v3, delta, eps, grid_step)
-    loops = _build_contours_from_segments(segments, grid_step)
-    perim = perimeter_from_loops(loops)
-    assert abs(perim - 40.0) < 2.0, f"Cube perimeter mismatch: {perim}"
-
-    # Рамка: внешний 20x20, внутренний 10x10
-    outer = make_box(-10, -10, 0, 10, 10, 5)
-    inner = make_box(-5, -5, 0, 5, 5, 5)
-    ring = np.vstack([outer, inner])
-    v1, v2, v3 = ring[:, 0], ring[:, 1], ring[:, 2]
-    segments = _slice_triangle_arrays(v1, v2, v3, delta, eps, grid_step)
-    loops = _build_contours_from_segments(segments, grid_step)
-    perim = perimeter_from_loops(loops)
-    assert abs(perim - (80.0 + 40.0)) < 4.0, f"Ring perimeter mismatch: {perim}"
-
-    # Проверка с поворотом и выравниванием
-    angle = np.deg2rad(30)
-    rot_z = np.array([
-        [np.cos(angle), -np.sin(angle), 0.0],
-        [np.sin(angle), np.cos(angle), 0.0],
-        [0.0, 0.0, 1.0]
-    ])
-    rot_x = np.array([
-        [1.0, 0.0, 0.0],
-        [0.0, np.cos(angle), -np.sin(angle)],
-        [0.0, np.sin(angle), np.cos(angle)]
-    ])
-    rot = rot_z @ rot_x
-    trans = np.array([15.0, -7.0, 3.0])
-    cube_rot = (cube.reshape(-1, 3) @ rot.T + trans).reshape(cube.shape)
-
-    # Имитируем alignment через расчет OBB
-    v1, v2, v3 = cube_rot[:, 0], cube_rot[:, 1], cube_rot[:, 2]
-    fake_vertices = np.stack([v1, v2, v3], axis=1)
-    max_area, _, tri_vertices = find_max_area_triangle_vectorized(fake_vertices)
-    edge1 = tri_vertices[1] - tri_vertices[0]
-    edge2 = tri_vertices[2] - tri_vertices[0]
-    normal = np.cross(edge1, edge2)
-    min_c, max_c, R = calculate_aligned_bounding_box_optimized(
-        fake_vertices, normal, tri_vertices[0]
-    )
-    aligned_min_z = float(min_c[2])
-
-    segments = _slice_triangle_arrays(
-        (v1 - tri_vertices[0]) @ R, (v2 - tri_vertices[0]) @ R, (v3 - tri_vertices[0]) @ R,
-        aligned_min_z + delta, eps, grid_step
-    )
-    loops = _build_contours_from_segments(segments, grid_step)
-    perim = perimeter_from_loops(loops)
-    assert abs(perim - 40.0) < 3.0, f"Aligned rotated cube mismatch: {perim}"
-
-    print("Slice self-tests passed.")
 
 
 def _is_binary_stl_fast(filename):
@@ -530,127 +281,6 @@ def _is_binary_stl_fast(filename):
         expected_size = 80 + 4 + num_triangles * 50
         return file_size == expected_size
 
-
-def _parse_stl_binary_streaming(filename, progress_callback=None, chunk_size=500000):
-    """
-    Разбор бинарного STL с потоковой обработкой для больших файлов.
-    Возвращает: (max_area_info, unique_vertices, total_triangles)
-    где max_area_info = (max_area, max_index, max_normal, max_vertices)
-    """
-    import os
-    
-    file_size = os.path.getsize(filename)
-    
-    with open(filename, 'rb') as f:
-        # Чтение заголовка и количества треугольников
-        f.read(80)  # Пропустить заголовок
-        num_triangles_bytes = f.read(4)
-        num_triangles = struct.unpack('I', num_triangles_bytes)[0]
-
-    # Отображение файла в память для доступа без копирования
-    mmap = np.memmap(filename, dtype=np.uint8, mode='r')
-
-    # Пропустить заголовок (80 байт) и количество треугольников (4 байта)
-    data_offset = 84
-
-    # Инициализация переменных отслеживания
-    max_area = 0.0
-    max_index = -1
-    max_normal = None
-    max_vertices = None
-
-    # Сбор вершин порциями
-    vertex_chunks = []
-
-    # Обработка порциями для контроля использования памяти
-    for chunk_start in range(0, num_triangles, chunk_size):
-        chunk_end = min(chunk_start + chunk_size, num_triangles)
-        chunk_size_current = chunk_end - chunk_start
-
-        # Вычисление байтовых смещений для этой порции
-        chunk_byte_start = data_offset + chunk_start * 50
-        chunk_byte_end = data_offset + chunk_end * 50
-
-        # Извлечение данных порции в виде структурированного массива - намного быстрее
-        chunk_data = np.frombuffer(
-            mmap[chunk_byte_start:chunk_byte_end],
-            dtype=np.dtype([
-                ('normal', '3f4'),
-                ('v1', '3f4'),
-                ('v2', '3f4'),
-                ('v3', '3f4'),
-                ('attr', 'u2')
-            ])
-        )
-
-        # Извлечение всех вершин из этой порции (chunk_size_current * 3 вершины)
-        # Преобразование для получения всех вершин в виде массива (chunk_size_current * 3, 3)
-        vertices_chunk = np.column_stack([
-            chunk_data['v1'].reshape(-1, 1),
-            chunk_data['v1'].reshape(-1, 1),
-            chunk_data['v1'].reshape(-1, 1)
-        ])
-
-        # На самом деле, нужно получить v1, v2, v3 отдельно
-        # Создание массива со всеми вершинами из этой порции
-        vertices_all = np.zeros((chunk_size_current * 3, 3), dtype=np.float32)
-        vertices_all[0::3] = chunk_data['v1']
-        vertices_all[1::3] = chunk_data['v2']
-        vertices_all[2::3] = chunk_data['v3']
-
-        # Округление вершин для удаления дубликатов и добавление в порции
-        vertices_rounded = np.round(vertices_all, 6)
-        vertex_chunks.append(vertices_rounded)
-
-        # Обработка треугольников для поиска максимальной площади (векторно)
-        # Вычисление площадей для всех треугольников в этой порции
-        v1 = chunk_data['v1']
-        v2 = chunk_data['v2']
-        v3 = chunk_data['v3']
-
-        edge1 = v2 - v1
-        edge2 = v3 - v1
-        cross = np.cross(edge1, edge2)
-        areas = 0.5 * np.linalg.norm(cross, axis=1)
-
-        # Поиск максимальной площади в этой порции
-        chunk_max_idx = np.argmax(areas)
-        chunk_max_area = areas[chunk_max_idx]
-
-        # Обновление глобального максимума
-        if chunk_max_area > max_area:
-            max_area = chunk_max_area
-            max_index = chunk_start + chunk_max_idx
-            max_normal = chunk_data[chunk_max_idx]['normal'].copy()
-            max_vertices = np.array([
-                v1[chunk_max_idx],
-                v2[chunk_max_idx],
-                v3[chunk_max_idx]
-            ])
-
-        # Сообщение о прогрессе
-        if progress_callback:
-            progress = (chunk_end / num_triangles) * 100
-            progress_callback(progress, f"Processing triangles: {chunk_end:,}/{num_triangles:,}")
-    
-    # Объединение и удаление дубликатов вершин
-    if vertex_chunks:
-        # Конкатенация всех вершин
-        all_vertices = np.concatenate(vertex_chunks, axis=0)
-        # Использование numpy unique для удаления дубликатов (намного быстрее, чем Python set)
-        unique_vertices = np.unique(all_vertices, axis=0)
-    else:
-        unique_vertices = np.zeros((0, 3), dtype=np.float32)
-
-    # Создание словаря с информацией о максимальном треугольнике
-    max_triangle_info = {
-        'max_area': max_area,
-        'max_index': max_index,
-        'max_normal': max_normal,
-        'max_vertices': max_vertices,
-    }
-
-    return max_triangle_info, unique_vertices, num_triangles
 
 
 def _iter_stl_binary_chunks(filename, chunk_size=500000):
@@ -1275,51 +905,6 @@ def _bruteforce_min_area_rectangle(points, step_deg=1.0):
     return best_angle, best_width, best_height, min_area
 
 
-def _run_self_checks():
-    """Минимальные самопроверки вращающихся калиперов без внешних файлов."""
-    np.random.seed(0)
-    voxel_mm = 0.5
-
-    def make_rotated_rectangle(width, height, angle_deg):
-        hw, hh = width / 2, height / 2
-        rect = np.array([
-            [-hw, -hh],
-            [hw, -hh],
-            [hw, hh],
-            [-hw, hh]
-        ], dtype=np.float64)
-        angle = np.deg2rad(angle_deg)
-        rot = np.array([
-            [np.cos(angle), -np.sin(angle)],
-            [np.sin(angle), np.cos(angle)]
-        ])
-        return rect @ rot.T
-
-    cases = [
-        (1000.0, 1500.0, 45.0),
-        (800.0, 500.0, 33.0),
-        (1200.0, 200.0, 12.0)
-    ]
-
-    for width, height, angle in cases:
-        corners = make_rotated_rectangle(width, height, angle)
-        jitter = np.random.uniform(-0.2, 0.2, size=(200, 2))
-        samples = np.vstack([corners, corners + jitter])
-
-        qx = np.rint(samples[:, 0] / voxel_mm).astype(np.int64)
-        qy = np.rint(samples[:, 1] / voxel_mm).astype(np.int64)
-        pts = np.column_stack([qx * voxel_mm, qy * voxel_mm])
-
-        hull_pts = compute_convex_hull_2d(pts)
-        rc_angle, rc_w, rc_h, rc_area = rotating_calipers_min_area_rectangle(hull_pts)
-        bf_angle, bf_w, bf_h, bf_area = _bruteforce_min_area_rectangle(hull_pts, step_deg=1.0)
-
-        assert rc_area <= bf_area + 1e-6, "Rotating calipers хуже brute-force"
-        assert abs(rc_w - width) <= 1.0 or abs(rc_h - width) <= 1.0, "Ширина >1мм"
-        assert abs(rc_h - height) <= 1.0 or abs(rc_w - height) <= 1.0, "Высота >1мм"
-
-    print("Self-checks passed.")
-
 
 def calculate_aligned_bounding_box_optimized(vertices, normal_vector, origin):
     """
@@ -1487,78 +1072,6 @@ def create_coordinate_system_from_triangle(triangle):
     return rotation_matrix, v1
 
 
-def calculate_aligned_bounding_box(triangles, normal_vector, origin):
-    """
-    Минимальный бокс, у которого одна грань перпендикулярна normal_vector.
-    Ищется оптимальный поворот в плоскости.
-    """
-    unique_vertices = set()
-    for triangle in triangles:
-        for vertex in triangle["vertices"]:
-            unique_vertices.add(tuple(vertex))
-
-    all_vertices = [np.array(v) for v in unique_vertices]
-
-    # Нормализуем нормаль
-    z_axis = normal_vector / np.linalg.norm(normal_vector)
-
-    # Проекция вершин на плоскость перпендикулярную нормали
-    projected_2d = []
-    for vertex in all_vertices:
-        v_translated = vertex - origin
-        projection_length = np.dot(v_translated, z_axis)
-        v_in_plane = v_translated - projection_length * z_axis
-        projected_2d.append(v_in_plane)
-
-    min_area = float("inf")
-    best_rotation = None
-
-    # Пробуем поворот с шагом 1 градус
-    for angle_deg in np.arange(0, 180, 1):
-        angle_rad = np.deg2rad(angle_deg)
-
-        # Базовые оси в плоскости
-        temp = np.array([1, 0, 0]) if abs(z_axis[0]) < 0.9 else np.array([0, 1, 0])
-
-        x_base = np.cross(z_axis, temp)
-        x_base = x_base / np.linalg.norm(x_base)
-        y_base = np.cross(z_axis, x_base)
-        y_base = y_base / np.linalg.norm(y_base)
-
-        # Поворот в плоскости
-        x_axis = np.cos(angle_rad) * x_base + np.sin(angle_rad) * y_base
-        y_axis = -np.sin(angle_rad) * x_base + np.cos(angle_rad) * y_base
-
-        # Проекция всех точек на оси
-        x_coords = [np.dot(v, x_axis) for v in projected_2d]
-        y_coords = [np.dot(v, y_axis) for v in projected_2d]
-
-        x_range = max(x_coords) - min(x_coords)
-        y_range = max(y_coords) - min(y_coords)
-        area = x_range * y_range
-
-        if area < min_area:
-            min_area = area
-            best_rotation = np.column_stack([x_axis, y_axis, z_axis])
-
-    # Итоговый бокс в найденной ориентации
-    transformed_vertices = []
-    for vertex in all_vertices:
-        translated = vertex - origin
-        transformed = best_rotation.T @ translated
-        transformed_vertices.append(transformed)
-
-    transformed_vertices = np.array(transformed_vertices)
-
-    min_coords = np.min(transformed_vertices, axis=0)
-    max_coords = np.max(transformed_vertices, axis=0)
-
-    return min_coords, max_coords, best_rotation
-
-
-
-
-
 def calculate_parallelepiped_volume(filename):
     """
     Объём минимального параллелепипеда, ориентированного по плоскости
@@ -1604,9 +1117,6 @@ def calculate_parallelepiped_volume(filename):
     }
 
 
-
-
-
 def get_bounding_box_dimensions(filename):
     """Вернуть размеры габаритного бокса (X, Y, Z) для STL."""
     result = calculate_parallelepiped_volume(filename)
@@ -1625,16 +1135,13 @@ def main():
         print("Использование: python stl.py <stl_file> [опции]")
         print("Опции:")
         print("  --volume          Рассчитать объём ориентированного параллелепипеда")
-        print("  --perimeter-z0    Рассчитать периметр отпечатка на плоскости Z=0")
         print("\nПримеры:")
         print("  python stl.py model.stl")
         print("  python stl.py model.stl --volume")
-        print("  python stl.py model.stl --perimeter-z0")
         return
 
     filename = sys.argv[1]
     calculate_volume = "--volume" in sys.argv
-    calculate_perimeter = "--perimeter" in sys.argv
 
     try:
         if calculate_volume:
@@ -1661,18 +1168,6 @@ def main():
                     f"[{result['max_coords'][0]:.6f}, {result['max_coords'][1]:.6f}, {result['max_coords'][2]:.6f}]"
                 )
                 print(f"\n  ОБЪЁМ: {result['volume']:.6f}")
-                print("=" * 60)
-        elif calculate_perimeter:
-            result = calculate_perimeter_aligned(filename)
-
-            if result:
-                print("\n" + "=" * 60)
-                print("Периметр отпечатка на плоскости")
-                print("=" * 60)
-                print(f"Плоскость Z: {result['z_plane']:.3f} (delta={result['delta']:.3f})")
-                print(f"Сегментов: {result['segments_count']}")
-                print(f"Контуров: {result['loops_count']}")
-                print(f"\n  ПЕРИМЕТР: {result['perimeter']:.6f}")
                 print("=" * 60)
         else:
             result = find_max_area_triangle(filename)

@@ -198,6 +198,7 @@ class BoundingBoxApp(QMainWindow):
         self.raw_z = None
         self.raw_volume = None
         self.raw_perimeter = None
+        self.raw_snap_vol = None
 
         # Базовые (исходные) размеры для пропорций
         self.base_raw_x = None
@@ -205,6 +206,7 @@ class BoundingBoxApp(QMainWindow):
         self.base_raw_z = None
         self.base_raw_volume = None
         self.base_raw_perimeter = None
+        self.base_raw_snap_vol = None
 
         self.stl_module = stlmod
         self.clipboard = QApplication.clipboard()
@@ -281,6 +283,7 @@ class BoundingBoxApp(QMainWindow):
         extras_layout = QHBoxLayout()
         self._create_extra_block(extras_layout, "Объём", "мм³", "volume")
         self._create_extra_block(extras_layout, "Периметр", "мм", "perimeter")
+        self._create_extra_block(extras_layout, "Снимаемый объём", "мм³", "snap_vol")
         layout.addLayout(extras_layout)
 
         unit_layout = QHBoxLayout()
@@ -355,7 +358,7 @@ class BoundingBoxApp(QMainWindow):
         parent_layout.addWidget(frame)
 
     def _create_extra_block(self, parent_layout, name, unit, attr):
-        if attr == "perimeter" and self.user_type == "general":
+        if (attr == "perimeter" or attr == "snap_vol") and self.user_type == "general":
             return
 
         frame = QFrame()
@@ -423,14 +426,14 @@ class BoundingBoxApp(QMainWindow):
             if self.user_type == "admin":
                 perimeter_result = self.stl_module.calculate_contact_perimeter_projected(
                     file_path,
-                    snap_xy=0.001,
+                    cell_mm=2.0,
                     chunk_size=200000,
-                    union_batch_size=20000,
+                    max_cells=10_000_000,
                 )
             transform_end_time = time.time()
             print("---Преобразование: %s секунд ---" % (transform_end_time - transform_start_time))
             volume = result["volume"] if result else None
-            perimeter = perimeter_result["perimeter"] if perimeter_result else None
+            perimeter = perimeter_result["perimeter_mm"] if perimeter_result else None
         except Exception as exc:
             self.status_text = f"Ошибка чтения файла: {exc}"
             self.status_label.setText(self.status_text)
@@ -455,6 +458,7 @@ class BoundingBoxApp(QMainWindow):
         self.base_raw_x, self.base_raw_y, self.base_raw_z = dims
         self.base_raw_volume = volume
         self.base_raw_perimeter = perimeter
+        self.base_raw_snap_vol = self.raw_snap_vol
 
         # Включаем поля для редактирования
         self.x_edit.setReadOnly(False)
@@ -486,6 +490,8 @@ class BoundingBoxApp(QMainWindow):
         self.volume_unit_label.setText(f"{unit}³")
         if hasattr(self, 'perimeter_unit_label'):
             self.perimeter_unit_label.setText(unit)
+        if hasattr(self, 'snap_vol_unit_label'):
+            self.snap_vol_unit_label.setText(f"{unit}³")
 
         # Линейные размеры
         self._updating_display = True
@@ -530,6 +536,7 @@ class BoundingBoxApp(QMainWindow):
         self.raw_z = None
         self.raw_volume = None
         self.raw_perimeter = None
+        self.raw_snap_vol = None
 
         # Отключаем поля для редактирования
         if hasattr(self, 'x_edit'):
