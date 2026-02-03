@@ -32,7 +32,71 @@ except ImportError:
     QVTKRenderWindowInteractor = None
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+APP_NAME = "BoundingBoxApp"
 
+
+def load_settings():
+    """Загружает настройки из JSON-файла в %APPDATA%"""
+    import json
+    import os
+    
+    # Определяем путь к файлу настроек
+    if sys.platform == "win32":
+        appdata_dir = os.getenv("APPDATA")
+        if not appdata_dir:
+            return {}
+        config_dir = os.path.join(appdata_dir, APP_NAME)
+        config_path = os.path.join(config_dir, "config.json")
+    else:
+        # Для других ОС используем домашнюю директорию
+        home_dir = os.path.expanduser("~")
+        config_dir = os.path.join(home_dir, f".{APP_NAME.lower()}")
+        config_path = os.path.join(config_dir, "config.json")
+    
+    # Если файл не существует, возвращаем пустой словарь
+    if not os.path.exists(config_path):
+        return {}
+    
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return {}
+
+
+def save_settings(settings):
+    """Сохраняет настройки в JSON-файл атомарно"""
+    import json
+    import os
+    
+    # Определяем путь к файлу настроек
+    if sys.platform == "win32":
+        appdata_dir = os.getenv("APPDATA")
+        if not appdata_dir:
+            return False
+        config_dir = os.path.join(appdata_dir, APP_NAME)
+        config_path = os.path.join(config_dir, "config.json")
+    else:
+        # Для других ОС используем домашнюю директорию
+        home_dir = os.path.expanduser("~")
+        config_dir = os.path.join(home_dir, f".{APP_NAME.lower()}")
+        config_path = os.path.join(config_dir, "config.json")
+    
+    # Создаем директорию, если её нет
+    os.makedirs(config_dir, exist_ok=True)
+    
+    # Записываем во временный файл, затем атомарно заменяем
+    try:
+        tmp_path = f"{config_path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as tmp:
+            json.dump(settings, tmp, ensure_ascii=False, indent=2)
+            tmp.flush()
+
+        # Атомарная замена
+        os.replace(tmp_path, config_path)
+        return True
+    except Exception:
+        return False
 
 
 def _format_dimension(value, unit=None):
@@ -64,6 +128,25 @@ def _convert_value(value, from_unit, to_unit, is_square=False, is_cubic=False):
     if is_cubic:
         factor = factor ** 3
     return value * factor
+
+
+def _parse_float(text):
+    if text is None:
+        return None
+    normalized = text.strip().replace(" ", "")
+    if not normalized or normalized == "—":
+        return None
+    normalized = normalized.replace(",", ".")
+    try:
+        return float(normalized)
+    except ValueError:
+        return None
+
+
+def _format_hours(value):
+    if value is None:
+        return "—"
+    return f"{value:.2f}"
 
 
 class LoginDialog(QDialog):
@@ -181,7 +264,7 @@ class BoundingBoxApp(QMainWindow):
         self.user_type = user_type
         super().__init__()
         self.setWindowTitle("Габариты детали")
-        self.setGeometry(100, 100, 1100, 600)
+        self.setGeometry(100, 100, 1250, 650)
 
         self.selected_file = ""
         self.status_text = ""
@@ -190,7 +273,7 @@ class BoundingBoxApp(QMainWindow):
         self.z_value = "—"
         self.volume_value = "—"
         self.perimeter_value = "—"
-        self.unit_var = "мм"
+        self.unit_var = "м"
 
         # Сырые значения в миллиметрах (как из функций)
         self.raw_x = None
@@ -199,6 +282,7 @@ class BoundingBoxApp(QMainWindow):
         self.raw_volume = None
         self.raw_perimeter = None
         self.raw_snap_vol = None
+        self.raw_relief_depth_mm = None
 
         # Базовые (исходные) размеры для пропорций
         self.base_raw_x = None
@@ -207,6 +291,7 @@ class BoundingBoxApp(QMainWindow):
         self.base_raw_volume = None
         self.base_raw_perimeter = None
         self.base_raw_snap_vol = None
+        self.base_raw_relief_depth_mm = None
 
         self.stl_module = stlmod
         self.clipboard = QApplication.clipboard()
@@ -217,6 +302,7 @@ class BoundingBoxApp(QMainWindow):
         self._updating_display = False  # Флаг для предотвращения рекурсии
 
         self._build_ui()
+        self._load_settings()
 
     def _build_ui(self):
         central_widget = QWidget()
@@ -284,12 +370,15 @@ class BoundingBoxApp(QMainWindow):
         self._create_extra_block(extras_layout, "Объём", "мм³", "volume")
         self._create_extra_block(extras_layout, "Периметр", "мм", "perimeter")
         self._create_extra_block(extras_layout, "Снимаемый объём", "мм³", "snap_vol")
+        self._create_extra_block(extras_layout, "Глубина рельефа", "мм", "relief_depth")
         layout.addLayout(extras_layout)
 
         unit_layout = QHBoxLayout()
         unit_layout.addWidget(QLabel("Единицы измерения:"))
         self.unit_combo = QComboBox()
         self.unit_combo.addItems(["мм", "см", "м"])
+        self.unit_combo.setCurrentText("м")
+        self._update_units("м")
         self.unit_combo.currentTextChanged.connect(self._update_units)
         unit_layout.addWidget(self.unit_combo)
         unit_layout.addStretch()
@@ -313,6 +402,101 @@ class BoundingBoxApp(QMainWindow):
 
         layout.addLayout(button_layout)
 
+        if self.user_type == "admin":
+            separator = QFrame()
+            separator.setFrameShape(QFrame.HLine)
+            separator.setFrameShadow(QFrame.Sunken)
+            layout.addWidget(separator)
+
+            work_time_label = QLabel("Время работы")
+            work_time_label.setStyleSheet("font-size: 12pt; font-weight: bold;")
+            layout.addWidget(work_time_label)
+
+            work_time_layout = QHBoxLayout()
+            work_time_layout.setSpacing(6)
+            self._create_admin_field_block(
+                work_time_layout,
+                "Желаемая толщина",
+                "мм",
+                "desired_thickness",
+                None,
+            )
+            self._create_admin_field_block(
+                work_time_layout,
+                "Время по периметру",
+                "ч.",
+                "t1_h",
+                None,
+                read_only=True,
+            )
+            self._create_admin_field_block(
+                work_time_layout,
+                "Время на объем",
+                "ч.",
+                "t2_h",
+                None,
+                read_only=True,
+            )
+            self._create_admin_field_block(
+                work_time_layout,
+                "Общее время",
+                "ч.",
+                "total_h",
+                None,
+                read_only=True,
+            )
+            layout.addLayout(work_time_layout)
+
+            separator_params = QFrame()
+            separator_params.setFrameShape(QFrame.HLine)
+            separator_params.setFrameShadow(QFrame.Sunken)
+            layout.addWidget(separator_params)
+
+            params_label = QLabel("Параметры")
+            params_label.setStyleSheet("font-size: 12pt; font-weight: bold;")
+            layout.addWidget(params_label)
+
+            params_layout = QHBoxLayout()
+            params_layout.setSpacing(6)
+            self._create_admin_field_block(
+                params_layout,
+                "Шаг по Z по периметру",
+                "мм",
+                "z_step",
+                None,
+            )
+            self._create_admin_field_block(
+                params_layout,
+                "Скорость по периметре",
+                "мм/мин",
+                "z_speed",
+                None,
+            )
+            self._create_admin_field_block(
+                params_layout,
+                "Скорость на объеме",
+                "м³/час",
+                "volume_hour",
+                None,
+            )
+            layout.addLayout(params_layout)
+
+            if hasattr(self, "desired_thickness_edit"):
+                self.desired_thickness_edit.textChanged.connect(self._recalculate_times)
+            if hasattr(self, "z_step_edit"):
+                self.z_step_edit.textChanged.connect(self._recalculate_times)
+            if hasattr(self, "z_speed_edit"):
+                self.z_speed_edit.textChanged.connect(self._recalculate_times)
+            if hasattr(self, "volume_hour_edit"):
+                self.volume_hour_edit.textChanged.connect(self._recalculate_times)
+
+            save_layout = QHBoxLayout()
+            save_layout.addStretch()
+            self.save_button = QPushButton("Сохранить")
+            self.save_button.clicked.connect(self._save_settings)
+            save_layout.addWidget(self.save_button)
+            layout.addLayout(save_layout)
+
         layout.addStretch()
 
         return widget
@@ -320,7 +504,7 @@ class BoundingBoxApp(QMainWindow):
     def _create_axis_block(self, parent_layout, axis, label, attr):
         frame = QFrame()
         frame_layout = QVBoxLayout(frame)
-        frame_layout.setContentsMargins(8, 8, 8, 8)
+        frame_layout.setContentsMargins(4, 4, 4, 4)
 
         # Первая строка: ось и метка
         header_layout = QHBoxLayout()
@@ -358,7 +542,7 @@ class BoundingBoxApp(QMainWindow):
         parent_layout.addWidget(frame)
 
     def _create_extra_block(self, parent_layout, name, unit, attr):
-        if (attr == "perimeter" or attr == "snap_vol") and self.user_type == "general":
+        if attr in ("perimeter", "snap_vol") and self.user_type == "general":
             return
 
         frame = QFrame()
@@ -392,6 +576,121 @@ class BoundingBoxApp(QMainWindow):
         setattr(self, f"{attr}_unit_label", unit_label)
 
         parent_layout.addWidget(frame)
+
+    def _create_admin_field_block(self, parent_layout, name, unit, attr, validator, read_only=False):
+        frame = QFrame()
+        frame_layout = QVBoxLayout(frame)
+        frame_layout.setContentsMargins(8, 8, 8, 8)
+
+        header_layout = QHBoxLayout()
+        name_label = QLabel(name)
+        name_label.setStyleSheet("font-weight: bold;")
+        header_layout.addWidget(name_label)
+        header_layout.addStretch()
+        frame_layout.addLayout(header_layout)
+
+        field_layout = QHBoxLayout()
+        value_edit = QLineEdit()
+        value_edit.setStyleSheet("border: 1px solid; padding: 2px;")
+        value_edit.setAlignment(Qt.AlignCenter)
+        value_edit.setMinimumWidth(120)
+        if validator is not None:
+            value_edit.setValidator(validator)
+        if read_only:
+            value_edit.setReadOnly(True)
+            value_edit.setEnabled(False)
+        field_layout.addWidget(value_edit)
+
+        unit_label = QLabel(unit)
+        unit_label.setFixedWidth(50)
+        field_layout.addWidget(unit_label)
+        field_layout.addStretch()
+
+        frame_layout.addLayout(field_layout)
+
+        setattr(self, f"{attr}_edit", value_edit)
+        setattr(self, f"{attr}_unit_label", unit_label)
+
+        parent_layout.addWidget(frame)
+
+    def _load_settings(self):
+        """Загружает сохранённые настройки из JSON и заполняет поля"""
+        if self.user_type != "admin":
+            return
+        settings = load_settings()
+        if not settings:
+            return
+
+        params = settings.get("params", {})
+        if "z_step_mm" in params and hasattr(self, "z_step_edit"):
+            val = params.get("z_step_mm")
+            if val is not None:
+                self.z_step_edit.setText(_format_dimension(val, "мм"))
+        if "speed_mm_min" in params and hasattr(self, "z_speed_edit"):
+            val = params.get("speed_mm_min")
+            if val is not None:
+                self.z_speed_edit.setText(_format_dimension(val, "мм/мин"))
+        if "volume_per_hour_m3_h" in params and hasattr(self, "volume_hour_edit"):
+            val = params.get("volume_per_hour_m3_h")
+            if val is not None:
+                self.volume_hour_edit.setText(_format_dimension(val, "м³/час"))
+
+        self._recalculate_times()
+
+    def _save_settings(self):
+        """Сохраняет текущие значения админских полей в JSON"""
+        if self.user_type != "admin":
+            return False
+
+        settings = {}
+        params = {}
+        if hasattr(self, "z_step_edit"):
+            params["z_step_mm"] = _parse_float(self.z_step_edit.text())
+
+        if hasattr(self, "z_speed_edit"):
+            params["speed_mm_min"] = _parse_float(self.z_speed_edit.text())
+
+        if hasattr(self, "volume_hour_edit"):
+            params["volume_per_hour_m3_h"] = _parse_float(self.volume_hour_edit.text())
+
+        settings["params"] = params
+        return save_settings(settings)
+
+    def _recalculate_times(self):
+        if self.user_type != "admin":
+            return
+        if not hasattr(self, "t1_h_edit") or not hasattr(self, "t2_h_edit"):
+            return
+
+        thickness_mm = _parse_float(getattr(self, "desired_thickness_edit", QLineEdit()).text())
+        z_step_mm = _parse_float(getattr(self, "z_step_edit", QLineEdit()).text())
+        speed_mm_min = _parse_float(getattr(self, "z_speed_edit", QLineEdit()).text())
+        volume_per_hour_m3_h = _parse_float(getattr(self, "volume_hour_edit", QLineEdit()).text())
+
+        t_perimeter_h = None
+        if (
+            self.raw_perimeter is not None
+            and thickness_mm is not None
+            and z_step_mm not in (None, 0)
+            and speed_mm_min not in (None, 0)
+        ):
+            t_perimeter_h = (
+                self.raw_perimeter * thickness_mm / z_step_mm / speed_mm_min / 60
+            )
+
+        t_volume_h = None
+        if self.raw_snap_vol is not None and volume_per_hour_m3_h not in (None, 0):
+            removed_volume_m3 = self.raw_snap_vol / 1_000_000_000
+            t_volume_h = removed_volume_m3 / volume_per_hour_m3_h
+
+        total_h = None
+        if t_perimeter_h is not None or t_volume_h is not None:
+            total_h = (t_perimeter_h or 0) + (t_volume_h or 0)
+
+        self.t1_h_edit.setText(_format_hours(t_perimeter_h))
+        self.t2_h_edit.setText(_format_hours(t_volume_h))
+        if hasattr(self, "total_h_edit"):
+            self.total_h_edit.setText(_format_hours(total_h))
 
     def _pick_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -431,12 +730,12 @@ class BoundingBoxApp(QMainWindow):
                     chunk_size=200000,
                     max_cells=10_000_000,
                 )
-                removed_result = self.stl_module.calculate_removed_volume_from_top(
-                    file_path,
-                    cell_mm=2.0,
-                    chunk_size=200000,
-                    max_cells=10_000_000,
-                )
+            removed_result = self.stl_module.calculate_removed_volume_from_top(
+                file_path,
+                cell_mm=2.0,
+                chunk_size=200000,
+                max_cells=10_000_000,
+            )
             transform_end_time = time.time()
             print("---Преобразование: %s секунд ---" % (transform_end_time - transform_start_time))
             volume = result["volume"] if result else None
@@ -464,12 +763,16 @@ class BoundingBoxApp(QMainWindow):
         self.raw_volume = volume
         self.raw_perimeter = perimeter
         self.raw_snap_vol = removed_volume
+        self.raw_relief_depth_mm = (
+            removed_result.get("relief_depth_mm") if removed_result else None
+        )
 
         # Сохраняем базовые размеры для пропорций
         self.base_raw_x, self.base_raw_y, self.base_raw_z = dims
         self.base_raw_volume = volume
         self.base_raw_perimeter = perimeter
         self.base_raw_snap_vol = self.raw_snap_vol
+        self.base_raw_relief_depth_mm = self.raw_relief_depth_mm
 
         # Включаем поля для редактирования
         self.x_edit.setReadOnly(False)
@@ -486,7 +789,15 @@ class BoundingBoxApp(QMainWindow):
         # Включаем кнопку копирования
         self.copy_button.setEnabled(True)
 
+        if self.user_type == "admin" and hasattr(self, "desired_thickness_edit"):
+            current_text = self.desired_thickness_edit.text().strip()
+            if not current_text:
+                self.desired_thickness_edit.setText(
+                    _format_dimension(self.raw_z, "мм") if self.raw_z is not None else ""
+                )
+
         self._update_display()
+        self._recalculate_times()
 
         # Setup visualization if STL
         self._setup_visualization(extension, file_path, result)
@@ -503,6 +814,8 @@ class BoundingBoxApp(QMainWindow):
             self.perimeter_unit_label.setText(unit)
         if hasattr(self, 'snap_vol_unit_label'):
             self.snap_vol_unit_label.setText(f"{unit}³")
+        if hasattr(self, 'relief_depth_unit_label'):
+            self.relief_depth_unit_label.setText(unit)
 
         # Линейные размеры
         self._updating_display = True
@@ -548,6 +861,13 @@ class BoundingBoxApp(QMainWindow):
             else:
                 self.snap_vol_label.setText("—")
 
+        if hasattr(self, 'relief_depth_label'):
+            if self.raw_relief_depth_mm is not None:
+                conv_relief = _convert_value(self.raw_relief_depth_mm, "мм", unit)
+                self.relief_depth_label.setText(_format_dimension(conv_relief, unit))
+            else:
+                self.relief_depth_label.setText("—")
+
     def _clear_raw(self):
         self.raw_x = None
         self.raw_y = None
@@ -555,6 +875,7 @@ class BoundingBoxApp(QMainWindow):
         self.raw_volume = None
         self.raw_perimeter = None
         self.raw_snap_vol = None
+        self.raw_relief_depth_mm = None
 
         # Отключаем поля для редактирования
         if hasattr(self, 'x_edit'):
@@ -623,6 +944,15 @@ class BoundingBoxApp(QMainWindow):
         # Обновляем объём пропорционально кубу коэффициента
         if self.base_raw_volume is not None:
             self.raw_volume = self.base_raw_volume * (ratio ** 3)
+
+        if self.base_raw_perimeter is not None:
+            self.raw_perimeter = self.base_raw_perimeter * ratio
+
+        if self.base_raw_snap_vol is not None:
+            self.raw_snap_vol = self.base_raw_snap_vol * (ratio ** 3)
+
+        if self.base_raw_relief_depth_mm is not None:
+            self.raw_relief_depth_mm = self.base_raw_relief_depth_mm * ratio
             
         # Обновляем отображение
         self._update_display()
@@ -634,6 +964,9 @@ class BoundingBoxApp(QMainWindow):
             self.raw_y = self.base_raw_y
             self.raw_z = self.base_raw_z
             self.raw_volume = self.base_raw_volume
+            self.raw_perimeter = self.base_raw_perimeter
+            self.raw_snap_vol = self.base_raw_snap_vol
+            self.raw_relief_depth_mm = self.base_raw_relief_depth_mm
             self._update_display()
 
     def _copy_sizes(self):
@@ -684,7 +1017,6 @@ class BoundingBoxApp(QMainWindow):
             print("---Визуализация: %s секунд ---" % (viz_end_time - viz_start_time))
         else:
             self.viz_widget.setVisible(False)
-
 
 
 def main():

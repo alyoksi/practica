@@ -445,12 +445,26 @@ def calculate_removed_volume_from_top(
     zmax.fill(-np.inf)
 
     projected_triangles = 0
+    eps_normal = 1e-12
+    depth_percentile = 99.9
     for chunk_start, chunk_end, total_triangles, v1, v2, v3 in _iter_stl_chunks_auto(
         filename, chunk_size=chunk_size
     ):
         v1_local = (v1 - origin) @ rotation_matrix
         v2_local = (v2 - origin) @ rotation_matrix
         v3_local = (v3 - origin) @ rotation_matrix
+
+        normals_local = np.cross(v2_local - v1_local, v3_local - v1_local)
+        top_mask = normals_local[:, 2] > eps_normal
+        if not np.any(top_mask):
+            if progress_callback:
+                progress = 30 + (chunk_end / total_triangles) * 70
+                progress_callback(progress, f"Raster: {chunk_end:,}/{total_triangles:,}")
+            continue
+
+        v1_local = v1_local[top_mask]
+        v2_local = v2_local[top_mask]
+        v3_local = v3_local[top_mask]
 
         v1_xy = v1_local[:, :2]
         v2_xy = v2_local[:, :2]
@@ -484,11 +498,19 @@ def calculate_removed_volume_from_top(
     valid_mask = footprint & np.isfinite(zmax)
     if not np.any(valid_mask):
         removed_volume_mm3 = 0.0
+        relief_depth_mm = 0.0
     else:
-        removed_volume_mm3 = float(np.sum((z_stock - zmax)[valid_mask]) * (cell_mm ** 2))
+        diff = (z_stock - zmax)[valid_mask]
+        removed_volume_mm3 = float(np.sum(diff) * (cell_mm ** 2))
+        diff = diff[np.isfinite(diff)]
+        if diff.size == 0:
+            relief_depth_mm = 0.0
+        else:
+            relief_depth_mm = float(np.percentile(diff, depth_percentile))
 
     return {
         'removed_volume_mm3': removed_volume_mm3,
+        'relief_depth_mm': relief_depth_mm,
         'cell_mm': cell_mm,
         'total_triangles': total_triangles,
         'projected_triangles': projected_triangles,
