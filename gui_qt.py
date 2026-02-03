@@ -423,8 +423,15 @@ class BoundingBoxApp(QMainWindow):
             transform_start_time = time.time()
             result = self.stl_module.calculate_parallelepiped_volume(file_path)
             perimeter_result = None
+            removed_result = None
             if self.user_type == "admin":
                 perimeter_result = self.stl_module.calculate_contact_perimeter_projected(
+                    file_path,
+                    cell_mm=2.0,
+                    chunk_size=200000,
+                    max_cells=10_000_000,
+                )
+                removed_result = self.stl_module.calculate_removed_volume_from_top(
                     file_path,
                     cell_mm=2.0,
                     chunk_size=200000,
@@ -434,6 +441,9 @@ class BoundingBoxApp(QMainWindow):
             print("---Преобразование: %s секунд ---" % (transform_end_time - transform_start_time))
             volume = result["volume"] if result else None
             perimeter = perimeter_result["perimeter_mm"] if perimeter_result else None
+            removed_volume = (
+                removed_result["removed_volume_mm3"] if removed_result else None
+            )
         except Exception as exc:
             self.status_text = f"Ошибка чтения файла: {exc}"
             self.status_label.setText(self.status_text)
@@ -453,6 +463,7 @@ class BoundingBoxApp(QMainWindow):
         self.raw_x, self.raw_y, self.raw_z = dims
         self.raw_volume = volume
         self.raw_perimeter = perimeter
+        self.raw_snap_vol = removed_volume
 
         # Сохраняем базовые размеры для пропорций
         self.base_raw_x, self.base_raw_y, self.base_raw_z = dims
@@ -529,6 +540,13 @@ class BoundingBoxApp(QMainWindow):
                 self.perimeter_label.setText(_format_dimension(conv_perimeter, unit))
             else:
                 self.perimeter_label.setText("—")
+
+        if hasattr(self, 'snap_vol_label'):
+            if self.raw_snap_vol is not None:
+                conv_snap_vol = _convert_value(self.raw_snap_vol, "мм", unit, is_cubic=True)
+                self.snap_vol_label.setText(_format_dimension(conv_snap_vol, unit))
+            else:
+                self.snap_vol_label.setText("—")
 
     def _clear_raw(self):
         self.raw_x = None

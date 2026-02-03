@@ -61,6 +61,56 @@ if _NUMBA_AVAILABLE:
                     if not (has_neg and has_pos):
                         grid[yy, xx] = True
 
+    @njit(cache=True)
+    def _rasterize_triangles_zmax_numba(occ, zmax, v1, v2, v3, min_x, min_y, cell_mm):
+        rows, cols = occ.shape
+        for i in range(v1.shape[0]):
+            x1, y1, z1 = v1[i, 0], v1[i, 1], v1[i, 2]
+            x2, y2, z2 = v2[i, 0], v2[i, 1], v2[i, 2]
+            x3, y3, z3 = v3[i, 0], v3[i, 1], v3[i, 2]
+
+            minx = x1 if x1 < x2 else x2
+            minx = minx if minx < x3 else x3
+            maxx = x1 if x1 > x2 else x2
+            maxx = maxx if maxx > x3 else x3
+            miny = y1 if y1 < y2 else y2
+            miny = miny if miny < y3 else y3
+            maxy = y1 if y1 > y2 else y2
+            maxy = maxy if maxy > y3 else y3
+
+            ix0 = int(np.floor((minx - min_x) / cell_mm))
+            ix1 = int(np.floor((maxx - min_x) / cell_mm))
+            iy0 = int(np.floor((miny - min_y) / cell_mm))
+            iy1 = int(np.floor((maxy - min_y) / cell_mm))
+
+            if ix1 < 0 or iy1 < 0 or ix0 >= cols or iy0 >= rows:
+                continue
+            if ix0 < 0:
+                ix0 = 0
+            if iy0 < 0:
+                iy0 = 0
+            if ix1 >= cols:
+                ix1 = cols - 1
+            if iy1 >= rows:
+                iy1 = rows - 1
+
+            denom = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3)
+            if np.abs(denom) < 1e-12:
+                continue
+
+            for yy in range(iy0, iy1 + 1):
+                py = min_y + (yy + 0.5) * cell_mm
+                for xx in range(ix0, ix1 + 1):
+                    px = min_x + (xx + 0.5) * cell_mm
+                    w1 = ((y2 - y3) * (px - x3) + (x3 - x2) * (py - y3)) / denom
+                    w2 = ((y3 - y1) * (px - x3) + (x1 - x3) * (py - y3)) / denom
+                    w3 = 1.0 - w1 - w2
+                    if w1 >= -1e-12 and w2 >= -1e-12 and w3 >= -1e-12:
+                        z = w1 * z1 + w2 * z2 + w3 * z3
+                        occ[yy, xx] = True
+                        if z > zmax[yy, xx]:
+                            zmax[yy, xx] = z
+
 
 def _rasterize_triangles_numpy(grid, v1_xy, v2_xy, v3_xy, min_x, min_y, cell_mm):
     rows, cols = grid.shape
@@ -98,6 +148,54 @@ def _rasterize_triangles_numpy(grid, v1_xy, v2_xy, v3_xy, min_x, min_y, cell_mm)
         mask = ((d1 >= 0) & (d2 >= 0) & (d3 >= 0)) | ((d1 <= 0) & (d2 <= 0) & (d3 <= 0))
 
         grid[np.ix_(ys, xs)] |= mask
+
+
+def _rasterize_triangles_zmax_numpy(occ, zmax, v1, v2, v3, min_x, min_y, cell_mm):
+    rows, cols = occ.shape
+    for i in range(v1.shape[0]):
+        x1, y1, z1 = v1[i]
+        x2, y2, z2 = v2[i]
+        x3, y3, z3 = v3[i]
+
+        minx = min(x1, x2, x3)
+        maxx = max(x1, x2, x3)
+        miny = min(y1, y2, y3)
+        maxy = max(y1, y2, y3)
+
+        ix0 = int(np.floor((minx - min_x) / cell_mm))
+        ix1 = int(np.floor((maxx - min_x) / cell_mm))
+        iy0 = int(np.floor((miny - min_y) / cell_mm))
+        iy1 = int(np.floor((maxy - min_y) / cell_mm))
+
+        if ix1 < 0 or iy1 < 0 or ix0 >= cols or iy0 >= rows:
+            continue
+        ix0 = max(ix0, 0)
+        iy0 = max(iy0, 0)
+        ix1 = min(ix1, cols - 1)
+        iy1 = min(iy1, rows - 1)
+
+        xs = np.arange(ix0, ix1 + 1)
+        ys = np.arange(iy0, iy1 + 1)
+        px = min_x + (xs + 0.5) * cell_mm
+        py = min_y + (ys + 0.5) * cell_mm
+        px_grid, py_grid = np.meshgrid(px, py)
+
+        denom = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3)
+        if abs(denom) < 1e-12:
+            continue
+
+        w1 = ((y2 - y3) * (px_grid - x3) + (x3 - x2) * (py_grid - y3)) / denom
+        w2 = ((y3 - y1) * (px_grid - x3) + (x1 - x3) * (py_grid - y3)) / denom
+        w3 = 1.0 - w1 - w2
+        mask = (w1 >= -1e-12) & (w2 >= -1e-12) & (w3 >= -1e-12)
+        if not np.any(mask):
+            continue
+
+        z = w1 * z1 + w2 * z2 + w3 * z3
+        zmax_block = zmax[np.ix_(ys, xs)]
+        zmax_block = np.where(mask, np.maximum(zmax_block, z), zmax_block)
+        zmax[np.ix_(ys, xs)] = zmax_block
+        occ[np.ix_(ys, xs)] |= mask
 
 
 def calculate_contact_perimeter_projected(
@@ -194,6 +292,8 @@ def calculate_contact_perimeter_projected(
     else:
         grid = np.zeros((rows, cols), dtype=np.bool_)
 
+    grid.fill(False)
+
     projected_triangles = 0
     for chunk_start, chunk_end, total_triangles, v1, v2, v3 in _iter_stl_chunks_auto(
         filename, chunk_size=chunk_size
@@ -233,6 +333,166 @@ def calculate_contact_perimeter_projected(
         'cell_mm': cell_mm,
         'total_triangles': total_triangles,
         'projected_triangles': projected_triangles,
+    }
+
+
+def calculate_removed_volume_from_top(
+    filename,
+    *,
+    cell_mm=10.0,
+    chunk_size=500000,
+    max_cells=10_000_000,
+    progress_callback=None,
+):
+    """
+    Оценка объёма снятого материала сверху по растровой сетке.
+    Возвращает dict: removed_volume_mm3, cell_mm, total_triangles, projected_triangles, z_stock.
+    """
+    import tempfile
+
+    max_area = 0.0
+    max_vertices = None
+    total_triangles = 0
+
+    for chunk_start, chunk_end, total_triangles, v1, v2, v3 in _iter_stl_chunks_auto(
+        filename, chunk_size=chunk_size
+    ):
+        edge1 = v2 - v1
+        edge2 = v3 - v1
+        cross = np.cross(edge1, edge2)
+        areas = 0.5 * np.linalg.norm(cross, axis=1)
+        chunk_max_idx = np.argmax(areas)
+        chunk_max_area = float(areas[chunk_max_idx])
+        if chunk_max_area > max_area:
+            max_area = chunk_max_area
+            max_vertices = np.array([
+                v1[chunk_max_idx],
+                v2[chunk_max_idx],
+                v3[chunk_max_idx],
+            ], dtype=np.float64)
+
+        if progress_callback:
+            progress = (chunk_end / total_triangles) * 10
+            progress_callback(progress, f"Max triangle: {chunk_end:,}/{total_triangles:,}")
+
+    if max_vertices is None:
+        return None
+
+    rotation_matrix, origin = create_coordinate_system_from_triangle_vectorized(max_vertices)
+
+    min_x = np.inf
+    min_y = np.inf
+    max_x = -np.inf
+    max_y = -np.inf
+    z_stock = -np.inf
+
+    for chunk_start, chunk_end, total_triangles, v1, v2, v3 in _iter_stl_chunks_auto(
+        filename, chunk_size=chunk_size
+    ):
+        v1_local = (v1 - origin) @ rotation_matrix
+        v2_local = (v2 - origin) @ rotation_matrix
+        v3_local = (v3 - origin) @ rotation_matrix
+
+        v1_xy = v1_local[:, :2]
+        v2_xy = v2_local[:, :2]
+        v3_xy = v3_local[:, :2]
+
+        min_x = min(min_x, v1_xy[:, 0].min(), v2_xy[:, 0].min(), v3_xy[:, 0].min())
+        min_y = min(min_y, v1_xy[:, 1].min(), v2_xy[:, 1].min(), v3_xy[:, 1].min())
+        max_x = max(max_x, v1_xy[:, 0].max(), v2_xy[:, 0].max(), v3_xy[:, 0].max())
+        max_y = max(max_y, v1_xy[:, 1].max(), v2_xy[:, 1].max(), v3_xy[:, 1].max())
+        z_stock = max(z_stock, v1_local[:, 2].max(), v2_local[:, 2].max(), v3_local[:, 2].max())
+
+        if progress_callback:
+            progress = 10 + (chunk_end / total_triangles) * 20
+            progress_callback(progress, f"Bounds: {chunk_end:,}/{total_triangles:,}")
+
+    if not np.isfinite(min_x) or not np.isfinite(min_y) or not np.isfinite(z_stock):
+        return None
+
+    width = max_x - min_x
+    height = max_y - min_y
+    if width <= 0 or height <= 0:
+        return {
+            'removed_volume_mm3': 0.0,
+            'cell_mm': cell_mm,
+            'total_triangles': total_triangles,
+            'projected_triangles': 0,
+            'z_stock': float(z_stock),
+        }
+
+    cols = int(np.ceil(width / cell_mm)) + 2
+    rows = int(np.ceil(height / cell_mm)) + 2
+    total_cells = rows * cols
+
+    if total_cells > max_cells:
+        temp_occ = tempfile.NamedTemporaryFile(suffix=".dat", delete=False)
+        temp_occ.close()
+        temp_footprint = tempfile.NamedTemporaryFile(suffix=".dat", delete=False)
+        temp_footprint.close()
+        temp_zmax = tempfile.NamedTemporaryFile(suffix=".dat", delete=False)
+        temp_zmax.close()
+        occ = np.memmap(temp_occ.name, dtype=np.bool_, mode="w+", shape=(rows, cols))
+        footprint = np.memmap(temp_footprint.name, dtype=np.bool_, mode="w+", shape=(rows, cols))
+        zmax = np.memmap(temp_zmax.name, dtype=np.float32, mode="w+", shape=(rows, cols))
+    else:
+        occ = np.zeros((rows, cols), dtype=np.bool_)
+        footprint = np.zeros((rows, cols), dtype=np.bool_)
+        zmax = np.zeros((rows, cols), dtype=np.float32)
+
+    occ.fill(False)
+    footprint.fill(False)
+    zmax.fill(-np.inf)
+
+    projected_triangles = 0
+    for chunk_start, chunk_end, total_triangles, v1, v2, v3 in _iter_stl_chunks_auto(
+        filename, chunk_size=chunk_size
+    ):
+        v1_local = (v1 - origin) @ rotation_matrix
+        v2_local = (v2 - origin) @ rotation_matrix
+        v3_local = (v3 - origin) @ rotation_matrix
+
+        v1_xy = v1_local[:, :2]
+        v2_xy = v2_local[:, :2]
+        v3_xy = v3_local[:, :2]
+
+        area2 = np.abs(
+            (v2_xy[:, 0] - v1_xy[:, 0]) * (v3_xy[:, 1] - v1_xy[:, 1])
+            - (v2_xy[:, 1] - v1_xy[:, 1]) * (v3_xy[:, 0] - v1_xy[:, 0])
+        )
+        valid = area2 > 1e-5
+        if np.any(valid):
+            projected_triangles += int(np.sum(valid))
+            v1_xy_valid = v1_xy[valid]
+            v2_xy_valid = v2_xy[valid]
+            v3_xy_valid = v3_xy[valid]
+            v1_valid = v1_local[valid]
+            v2_valid = v2_local[valid]
+            v3_valid = v3_local[valid]
+
+            if _NUMBA_AVAILABLE:
+                _rasterize_triangles_zmax_numba(occ, zmax, v1_valid, v2_valid, v3_valid, min_x, min_y, cell_mm)
+                _rasterize_triangles_numba(footprint, v1_xy_valid, v2_xy_valid, v3_xy_valid, min_x, min_y, cell_mm)
+            else:
+                _rasterize_triangles_zmax_numpy(occ, zmax, v1_valid, v2_valid, v3_valid, min_x, min_y, cell_mm)
+                _rasterize_triangles_numpy(footprint, v1_xy_valid, v2_xy_valid, v3_xy_valid, min_x, min_y, cell_mm)
+
+        if progress_callback:
+            progress = 30 + (chunk_end / total_triangles) * 70
+            progress_callback(progress, f"Raster: {chunk_end:,}/{total_triangles:,}")
+
+    valid_mask = footprint & np.isfinite(zmax)
+    if not np.any(valid_mask):
+        removed_volume_mm3 = 0.0
+    else:
+        removed_volume_mm3 = float(np.sum((z_stock - zmax)[valid_mask]) * (cell_mm ** 2))
+
+    return {
+        'removed_volume_mm3': removed_volume_mm3,
+        'cell_mm': cell_mm,
+        'total_triangles': total_triangles,
+        'projected_triangles': projected_triangles,
+        'z_stock': float(z_stock),
     }
 
 
@@ -713,28 +973,40 @@ def create_coordinate_system_from_triangle_vectorized(triangle_vertices):
 
     z_axis = z_axis / z_norm
 
-    # Ось X: вдоль первого ребра
-    x_axis = edge1
+    # Ось X: проекция более длинного ребра на плоскость (перпендикуляр к Z)
+    if np.dot(edge2, edge2) > np.dot(edge1, edge1):
+        edge_base = edge2
+    else:
+        edge_base = edge1
+
+    x_axis = edge_base - np.dot(edge_base, z_axis) * z_axis
     x_norm = np.linalg.norm(x_axis)
     if x_norm < 1e-10:
-        # Ребро слишком короткое, использовать произвольный перпендикулярный вектор
+        # Ребро слишком короткое, используем произвольный перпендикулярный вектор
         if abs(z_axis[0]) < 0.9:
             temp = np.array([1.0, 0.0, 0.0])
         else:
             temp = np.array([0.0, 1.0, 0.0])
         x_axis = np.cross(z_axis, temp)
         x_norm = np.linalg.norm(x_axis)
+        if x_norm < 1e-12:
+            return np.eye(3), v1
 
     x_axis = x_axis / x_norm
 
-    # Ось Y: перпендикулярна X и Z
+    # Ось Y: перпендикулярна X и Z (всегда нормализуем)
     y_axis = np.cross(z_axis, x_axis)
     y_norm = np.linalg.norm(y_axis)
-    if y_norm < 1e-10:
-        # Не должно происходить при правильной нормализации
-        y_axis = np.array([0.0, 0.0, 1.0])
-    else:
-        y_axis = y_axis / y_norm
+    if y_norm < 1e-12:
+        return np.eye(3), v1
+    y_axis = y_axis / y_norm
+
+    # Перепроверка ортонормированности (устраняем накопленную погрешность)
+    x_axis = np.cross(y_axis, z_axis)
+    x_norm = np.linalg.norm(x_axis)
+    if x_norm < 1e-12:
+        return np.eye(3), v1
+    x_axis = x_axis / x_norm
 
     # Матрица вращения (столбцы - базисные векторы)
     rotation_matrix = np.column_stack([x_axis, y_axis, z_axis])
