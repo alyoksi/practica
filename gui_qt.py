@@ -1,11 +1,12 @@
 import os
 import sys
+import math
 
 import numpy as np
 import stl.stl as stlmod
 import visualizer
 
-from PySide6.QtCore import Qt, QMimeData, QUrl
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -33,7 +34,7 @@ except ImportError:
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 APP_NAME = "BoundingBoxApp"
-
+PASSWORD = "donatoni@s-kamen.ru"
 
 def load_settings():
     """Загружает настройки из JSON-файла в %APPDATA%"""
@@ -224,7 +225,7 @@ class LoginDialog(QDialog):
         """Вход как администратор"""
         password = self.password_edit.text().strip()
         
-        if password == "admin":
+        if password == PASSWORD:
             self.user_type = "admin"
             self.accept()
         else:
@@ -283,6 +284,7 @@ class BoundingBoxApp(QMainWindow):
         self.raw_perimeter = None
         self.raw_snap_vol = None
         self.raw_relief_depth_mm = None
+        self.raw_relief_depth_bottom_mm = None
 
         # Базовые (исходные) размеры для пропорций
         self.base_raw_x = None
@@ -292,6 +294,8 @@ class BoundingBoxApp(QMainWindow):
         self.base_raw_perimeter = None
         self.base_raw_snap_vol = None
         self.base_raw_relief_depth_mm = None
+        self.base_raw_relief_depth_bottom_mm = None
+        self._stored_params = {}
 
         self.stl_module = stlmod
         self.clipboard = QApplication.clipboard()
@@ -402,25 +406,25 @@ class BoundingBoxApp(QMainWindow):
 
         layout.addLayout(button_layout)
 
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(separator)
+
+        work_time_label = QLabel("Время работы")
+        work_time_label.setStyleSheet("font-size: 12pt; font-weight: bold;")
+        layout.addWidget(work_time_label)
+
+        work_time_layout = QHBoxLayout()
+        work_time_layout.setSpacing(6)
+        self._create_admin_field_block(
+            work_time_layout,
+            "Желаемая толщина",
+            "мм",
+            "desired_thickness",
+            None,
+        )
         if self.user_type == "admin":
-            separator = QFrame()
-            separator.setFrameShape(QFrame.HLine)
-            separator.setFrameShadow(QFrame.Sunken)
-            layout.addWidget(separator)
-
-            work_time_label = QLabel("Время работы")
-            work_time_label.setStyleSheet("font-size: 12pt; font-weight: bold;")
-            layout.addWidget(work_time_label)
-
-            work_time_layout = QHBoxLayout()
-            work_time_layout.setSpacing(6)
-            self._create_admin_field_block(
-                work_time_layout,
-                "Желаемая толщина",
-                "мм",
-                "desired_thickness",
-                None,
-            )
             self._create_admin_field_block(
                 work_time_layout,
                 "Время по периметру",
@@ -437,16 +441,19 @@ class BoundingBoxApp(QMainWindow):
                 None,
                 read_only=True,
             )
-            self._create_admin_field_block(
-                work_time_layout,
-                "Общее время",
-                "ч.",
-                "total_h",
-                None,
-                read_only=True,
-            )
-            layout.addLayout(work_time_layout)
+        self._create_admin_field_block(
+            work_time_layout,
+            "Общее время",
+            "ч.",
+            "total_h",
+            None,
+            read_only=True,
+        )
+        if self.user_type == "general":
+            self.total_h_unit_label.setText("дн.")
+        layout.addLayout(work_time_layout)
 
+        if self.user_type == "admin":
             separator_params = QFrame()
             separator_params.setFrameShape(QFrame.HLine)
             separator_params.setFrameShadow(QFrame.Sunken)
@@ -481,21 +488,32 @@ class BoundingBoxApp(QMainWindow):
             )
             layout.addLayout(params_layout)
 
-            if hasattr(self, "desired_thickness_edit"):
-                self.desired_thickness_edit.textChanged.connect(self._recalculate_times)
-            if hasattr(self, "z_step_edit"):
-                self.z_step_edit.textChanged.connect(self._recalculate_times)
-            if hasattr(self, "z_speed_edit"):
-                self.z_speed_edit.textChanged.connect(self._recalculate_times)
-            if hasattr(self, "volume_hour_edit"):
-                self.volume_hour_edit.textChanged.connect(self._recalculate_times)
+        if hasattr(self, "desired_thickness_edit"):
+            self.desired_thickness_edit.textChanged.connect(self._recalculate_times)
+        if hasattr(self, "z_step_edit"):
+            self.z_step_edit.textChanged.connect(self._recalculate_times)
+        if hasattr(self, "z_speed_edit"):
+            self.z_speed_edit.textChanged.connect(self._recalculate_times)
+        if hasattr(self, "volume_hour_edit"):
+            self.volume_hour_edit.textChanged.connect(self._recalculate_times)
 
+        if self.user_type == "admin":
             save_layout = QHBoxLayout()
             save_layout.addStretch()
             self.save_button = QPushButton("Сохранить")
             self.save_button.clicked.connect(self._save_settings)
             save_layout.addWidget(self.save_button)
             layout.addLayout(save_layout)
+
+        self.depth_warning_label = QLabel("")
+        self.depth_warning_label.setStyleSheet("color: #b58900;")
+        self.depth_warning_label.setWordWrap(True)
+        layout.addWidget(self.depth_warning_label)
+
+        self.double_sided_label = QLabel("")
+        self.double_sided_label.setStyleSheet("color: #b58900;")
+        self.double_sided_label.setWordWrap(True)
+        layout.addWidget(self.double_sided_label)
 
         layout.addStretch()
 
@@ -542,8 +560,6 @@ class BoundingBoxApp(QMainWindow):
         parent_layout.addWidget(frame)
 
     def _create_extra_block(self, parent_layout, name, unit, attr):
-        if attr in ("perimeter", "snap_vol") and self.user_type == "general":
-            return
 
         frame = QFrame()
         frame_layout = QVBoxLayout(frame)
@@ -615,13 +631,15 @@ class BoundingBoxApp(QMainWindow):
 
     def _load_settings(self):
         """Загружает сохранённые настройки из JSON и заполняет поля"""
-        if self.user_type != "admin":
-            return
         settings = load_settings()
         if not settings:
+            self._stored_params = {}
             return
 
         params = settings.get("params", {})
+        self._stored_params = params
+        if self.user_type != "admin":
+            return
         if "z_step_mm" in params and hasattr(self, "z_step_edit"):
             val = params.get("z_step_mm")
             if val is not None:
@@ -657,15 +675,19 @@ class BoundingBoxApp(QMainWindow):
         return save_settings(settings)
 
     def _recalculate_times(self):
-        if self.user_type != "admin":
-            return
-        if not hasattr(self, "t1_h_edit") or not hasattr(self, "t2_h_edit"):
-            return
-
         thickness_mm = _parse_float(getattr(self, "desired_thickness_edit", QLineEdit()).text())
-        z_step_mm = _parse_float(getattr(self, "z_step_edit", QLineEdit()).text())
-        speed_mm_min = _parse_float(getattr(self, "z_speed_edit", QLineEdit()).text())
-        volume_per_hour_m3_h = _parse_float(getattr(self, "volume_hour_edit", QLineEdit()).text())
+        if hasattr(self, "z_step_edit"):
+            z_step_mm = _parse_float(self.z_step_edit.text())
+        else:
+            z_step_mm = self._stored_params.get("z_step_mm")
+        if hasattr(self, "z_speed_edit"):
+            speed_mm_min = _parse_float(self.z_speed_edit.text())
+        else:
+            speed_mm_min = self._stored_params.get("speed_mm_min")
+        if hasattr(self, "volume_hour_edit"):
+            volume_per_hour_m3_h = _parse_float(self.volume_hour_edit.text())
+        else:
+            volume_per_hour_m3_h = self._stored_params.get("volume_per_hour_m3_h")
 
         t_perimeter_h = None
         if (
@@ -687,10 +709,50 @@ class BoundingBoxApp(QMainWindow):
         if t_perimeter_h is not None or t_volume_h is not None:
             total_h = (t_perimeter_h or 0) + (t_volume_h or 0)
 
-        self.t1_h_edit.setText(_format_hours(t_perimeter_h))
-        self.t2_h_edit.setText(_format_hours(t_volume_h))
+        if hasattr(self, "t1_h_edit"):
+            self.t1_h_edit.setText(_format_hours(t_perimeter_h))
+        if hasattr(self, "t2_h_edit"):
+            self.t2_h_edit.setText(_format_hours(t_volume_h))
         if hasattr(self, "total_h_edit"):
-            self.total_h_edit.setText(_format_hours(total_h))
+            if total_h is None:
+                self.total_h_edit.setText("—")
+            elif self.user_type == "general":
+                total_days = int(math.ceil(total_h / 24.0))
+                self.total_h_edit.setText(str(total_days))
+            else:
+                self.total_h_edit.setText(_format_hours(total_h))
+
+        self._update_depth_warning()
+
+    def _update_depth_warning(self):
+        if not hasattr(self, "depth_warning_label"):
+            return
+        thickness_mm = _parse_float(getattr(self, "desired_thickness_edit", QLineEdit()).text())
+        relief_depth_mm = self.raw_relief_depth_mm
+        if thickness_mm is None or relief_depth_mm is None:
+            self.depth_warning_label.setText("")
+            return
+        if thickness_mm - relief_depth_mm < 40.0:
+            self.depth_warning_label.setText(
+                "Внимание: глубина рельефа слишком большая — остаётся меньше 40 мм камня в самом глубоком месте по рельефу."
+            )
+        else:
+            self.depth_warning_label.setText("")
+
+    def _update_double_sided_warning(self):
+        if not hasattr(self, "double_sided_label"):
+            return
+        bottom_depth = self.raw_relief_depth_bottom_mm
+        if bottom_depth is None:
+            self.double_sided_label.setText("")
+            return
+        bottom_threshold_mm = 1.0
+        if bottom_depth > bottom_threshold_mm:
+            self.double_sided_label.setText(
+                "Обнаружена глубина снизу — требуется двусторонняя обработка (переворот детали)."
+            )
+        else:
+            self.double_sided_label.setText("")
 
     def _pick_file(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -721,16 +783,13 @@ class BoundingBoxApp(QMainWindow):
             import time
             transform_start_time = time.time()
             result = self.stl_module.calculate_parallelepiped_volume(file_path)
-            perimeter_result = None
-            removed_result = None
-            if self.user_type == "admin":
-                perimeter_result = self.stl_module.calculate_contact_perimeter_projected(
-                    file_path,
-                    cell_mm=2.0,
-                    chunk_size=200000,
-                    max_cells=10_000_000,
-                )
-            removed_result = self.stl_module.calculate_removed_volume_from_top(
+            perimeter_result = self.stl_module.calculate_contact_perimeter_projected(
+                file_path,
+                cell_mm=2.0,
+                chunk_size=200000,
+                max_cells=10_000_000,
+            )
+            removed_result = self.stl_module.calculate_removed_volume_top_and_bottom(
                 file_path,
                 cell_mm=2.0,
                 chunk_size=200000,
@@ -741,7 +800,7 @@ class BoundingBoxApp(QMainWindow):
             volume = result["volume"] if result else None
             perimeter = perimeter_result["perimeter_mm"] if perimeter_result else None
             removed_volume = (
-                removed_result["removed_volume_mm3"] if removed_result else None
+                removed_result["removed_volume_mm3_top"] if removed_result else None
             )
         except Exception as exc:
             self.status_text = f"Ошибка чтения файла: {exc}"
@@ -764,7 +823,10 @@ class BoundingBoxApp(QMainWindow):
         self.raw_perimeter = perimeter
         self.raw_snap_vol = removed_volume
         self.raw_relief_depth_mm = (
-            removed_result.get("relief_depth_mm") if removed_result else None
+            removed_result.get("relief_depth_mm_top") if removed_result else None
+        )
+        self.raw_relief_depth_bottom_mm = (
+            removed_result.get("relief_depth_mm_bottom") if removed_result else None
         )
 
         # Сохраняем базовые размеры для пропорций
@@ -773,6 +835,7 @@ class BoundingBoxApp(QMainWindow):
         self.base_raw_perimeter = perimeter
         self.base_raw_snap_vol = self.raw_snap_vol
         self.base_raw_relief_depth_mm = self.raw_relief_depth_mm
+        self.base_raw_relief_depth_bottom_mm = self.raw_relief_depth_bottom_mm
 
         # Включаем поля для редактирования
         self.x_edit.setReadOnly(False)
@@ -789,7 +852,7 @@ class BoundingBoxApp(QMainWindow):
         # Включаем кнопку копирования
         self.copy_button.setEnabled(True)
 
-        if self.user_type == "admin" and hasattr(self, "desired_thickness_edit"):
+        if hasattr(self, "desired_thickness_edit"):
             current_text = self.desired_thickness_edit.text().strip()
             if not current_text:
                 self.desired_thickness_edit.setText(
@@ -798,6 +861,7 @@ class BoundingBoxApp(QMainWindow):
 
         self._update_display()
         self._recalculate_times()
+        self._update_double_sided_warning()
 
         # Setup visualization if STL
         self._setup_visualization(extension, file_path, result)
@@ -876,6 +940,10 @@ class BoundingBoxApp(QMainWindow):
         self.raw_perimeter = None
         self.raw_snap_vol = None
         self.raw_relief_depth_mm = None
+        self.raw_relief_depth_bottom_mm = None
+
+        self._update_depth_warning()
+        self._update_double_sided_warning()
 
         # Отключаем поля для редактирования
         if hasattr(self, 'x_edit'):
@@ -953,9 +1021,14 @@ class BoundingBoxApp(QMainWindow):
 
         if self.base_raw_relief_depth_mm is not None:
             self.raw_relief_depth_mm = self.base_raw_relief_depth_mm * ratio
+
+        if self.base_raw_relief_depth_bottom_mm is not None:
+            self.raw_relief_depth_bottom_mm = self.base_raw_relief_depth_bottom_mm * ratio
             
         # Обновляем отображение
         self._update_display()
+        self._recalculate_times()
+        self._update_double_sided_warning()
 
     def _restore_original(self):
         """Восстановить исходные размеры из файла"""
@@ -967,7 +1040,10 @@ class BoundingBoxApp(QMainWindow):
             self.raw_perimeter = self.base_raw_perimeter
             self.raw_snap_vol = self.base_raw_snap_vol
             self.raw_relief_depth_mm = self.base_raw_relief_depth_mm
+            self.raw_relief_depth_bottom_mm = self.base_raw_relief_depth_bottom_mm
             self._update_display()
+            self._recalculate_times()
+            self._update_double_sided_warning()
 
     def _copy_sizes(self):
         """Копировать размеры модели в буфер обмена"""
